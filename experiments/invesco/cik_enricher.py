@@ -60,7 +60,17 @@ _GENERIC_NAME_WORDS = {
     "CORP", "CORPORATION", "DE", "GROUP", "HOLDING", "HOLDINGS", "INC",
     "INCORPORATED", "INTL", "INTERNATIONAL", "LIMITED", "LTD", "LLC", "NV",
     "OF", "ORD", "ORDINARY", "PLC", "SA", "SE", "SPA", "THE",
+    # Foreign corporate-form suffixes (report §4: strip PJSC, AB, etc.)
+    "PJSC", "JSC", "OJSC", "CJSC", "AB", "SAB", "CV", "SABDECV",
+    "KK", "BERHAD", "BHD", "TBK", "PT", "TBHK", "ASA", "TAS",
+    "KGAA", "GMBH", "SRL", "SARL", "SGPS", "AD", "DD", "AS",
+    "OYJ", "ABP", "PUBL", "HF",
 }
+
+# Regex to strip trailing share-class / line suffixes (e.g. -H, -O, -A, -C)
+# before normalisation.  Matches a hyphen followed by one or two uppercase letters
+# at the very end of a name.
+_SHARE_CLASS_SUFFIX_RE = re.compile(r"\s*-\s*[A-Z]{1,2}\s*$")
 
 # ---------------------------------------------------------------------------
 # Recall-variant constants (used only for broadening search, never for final
@@ -71,6 +81,10 @@ _RECALL_SUFFIX_WORDS = {
     "REG", "ORD", "NEW", "EO", "DL", "SHS", "SHARES", "UNSP",
     "REGISTERED", "BEARER", "NOMINAL", "NAMENS", "INHABER",
     "VINKULIERT", "VINK", "NA", "BR",
+    # Additional share-class / corporate-form words found in global ETF labels
+    "PREF", "PREFERRED", "PREFERENCE", "PREFS",
+    "NVDR", "DR", "GDR", "ADR",
+    "NPV", "PAR",
 }
 
 _TRANSLITERATION_PAIRS: list[tuple[str, str]] = [
@@ -93,6 +107,7 @@ _ABBREVIATION_MAP: dict[str, str] = {
     "TECHS": "TECHNOLOGIES",
     "FIN": "FINANCIAL",
     "FINL": "FINANCIAL",
+    "FINANCIERO": "FINANCIAL",
     "PHARMA": "PHARMACEUTICAL",
     "CHEM": "CHEMICAL",
     "ELEC": "ELECTRIC",
@@ -104,12 +119,13 @@ _ABBREVIATION_MAP: dict[str, str] = {
     "DEV": "DEVELOPMENT",
     "PROP": "PROPERTIES",
     "RES": "RESOURCES",
-    "COMM": "COMMUNICATIONS",
+    "COMM": "COMMERCIAL",
     "TELECOMM": "TELECOMMUNICATIONS",
     "BANCSHRS": "BANCSHARES",
     "SYS": "SYSTEMS",
     "SOLS": "SOLUTIONS",
     "INDS": "INDUSTRIES",
+    "IND": "INDUSTRIAL",
     "PRODS": "PRODUCTS",
     "PETRO": "PETROLEUM",
     "ENTMT": "ENTERTAINMENT",
@@ -117,6 +133,22 @@ _ABBREVIATION_MAP: dict[str, str] = {
     "PWR": "POWER",
     "INS": "INSURANCE",
     "ASSUR": "ASSURANCE",
+    "BK": "BANK",
+    "BKG": "BANKING",
+    "BANCORP": "BANCORP",
+    "BANC": "BANK",
+    "SECS": "SECURITIES",
+    "MTG": "MORTGAGE",
+    "GOVT": "GOVERNMENT",
+    "REINS": "REINSURANCE",
+    "TRANSN": "TRANSPORTATION",
+    "TRANSP": "TRANSPORTATION",
+    "AUTO": "AUTOMOBILE",
+    "AUTOS": "AUTOMOBILES",
+    "CONSTRUCTN": "CONSTRUCTION",
+    "ENGR": "ENGINEERING",
+    "INVT": "INVESTMENT",
+    "INVTS": "INVESTMENTS",
 }
 
 _RECALL_CLASS_RE = re.compile(r"\bCLASS\s+[A-Z0-9]\b")
@@ -219,6 +251,8 @@ class FigiHint:
     market_sector: str
     security_type: str
     score: float
+    composite_figi: str = ""
+    share_class_figi: str = ""
 
 
 @dataclasses.dataclass(slots=True)
@@ -238,6 +272,12 @@ class ResolutionResult:
     cik: Optional[str]
     confidence: float
     rationale: str
+    # FIGI-derived identity fields (report §5: persist best hint)
+    ticker: Optional[str] = None
+    exchange_code: Optional[str] = None
+    security_type: Optional[str] = None
+    composite_figi: Optional[str] = None
+    share_class_figi: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -285,10 +325,13 @@ def normalize_ticker(value: Any) -> str:
 def normalize_name(value: Any) -> str:
     """Canonical name normalization for matching and validation.
 
-    Applies HTML-entity decoding, uppercasing, punctuation collapse,
-    and legal/generic-suffix removal.
+    Applies HTML-entity decoding, uppercasing, share-class suffix removal,
+    punctuation collapse, and legal/generic-suffix removal.
     """
     raw = html_module.unescape(str(value or "")).upper()
+    # Strip trailing share-class/line suffixes (e.g. -H, -O, -A) before
+    # the dash-to-space replacement so they don't leave stray single letters.
+    raw = _SHARE_CLASS_SUFFIX_RE.sub("", raw)
     raw = raw.replace("&", " AND ").replace("/", " ").replace("-", " ")
     raw = _NON_ALNUM_RE.sub(" ", raw)
     words = [w for w in raw.split() if w and w not in _GENERIC_NAME_WORDS and not w.isdigit()]
@@ -750,14 +793,34 @@ class CIKResolver:
         if not company.name:
             return ResolutionResult(cik=None, confidence=0.0, rationale="missing_name")
 
+        # 2 & 3. FIGI hints (computed early so all return paths can use them)
+        figi_hints = self._get_figi_hints(company)
+
+        # Helper: build result with best-FIGI identity fields attached
+        def _make_result(
+            cik: Optional[str],
+            confidence: float,
+            rationale: str,
+        ) -> ResolutionResult:
+            best_hint = figi_hints[0] if figi_hints else None
+            return ResolutionResult(
+                cik=cik,
+                confidence=confidence,
+                rationale=rationale,
+                ticker=best_hint.ticker if best_hint else None,
+                exchange_code=best_hint.exch_code if best_hint else None,
+                security_type=best_hint.security_type if best_hint else None,
+                composite_figi=best_hint.composite_figi if best_hint else None,
+                share_class_figi=best_hint.share_class_figi if best_hint else None,
+            )
+
         # 1. Validate existing CIK
         if company.existing_cik:
             validated = self._validate_existing_cik(company)
             if validated is not None:
-                return validated
+                # Re-wrap with FIGI fields
+                return _make_result(validated.cik, validated.confidence, validated.rationale)
 
-        # 2 & 3. FIGI hints + local candidate collection
-        figi_hints = self._get_figi_hints(company)
         has_identifier = bool(figi_hints)
         candidates = self._collect_candidates(company, figi_hints)
 
@@ -770,12 +833,12 @@ class CIKResolver:
             self._add_browse_candidates(company, figi_hints, candidates)
 
         if not candidates:
-            return ResolutionResult(cik=None, confidence=0.0, rationale="no_candidates")
+            return _make_result(None, 0.0, "no_candidates")
 
         # 5 & 6. Validate and rank
         ranked = self._validate_and_rank_candidates(company, figi_hints, candidates)
         if not ranked:
-            return ResolutionResult(cik=None, confidence=0.0, rationale="validation_failed")
+            return _make_result(None, 0.0, "validation_failed")
 
         best_cik, best_score, best_reason, best_id_backed = ranked[0]
         second_score = ranked[1][1] if len(ranked) > 1 else 0.0
@@ -784,21 +847,26 @@ class CIKResolver:
         if best_id_backed:
             # Identifier-backed: lower bar
             accept = best_score >= 0.95 and (best_score - second_score >= 0.06 or best_score >= 1.10)
+        elif "name_exact:" in best_reason or "browse_edgar:" in best_reason:
+            # Name-only but with direct SEC entity evidence (exact match in
+            # company_tickers_exchange / cik-lookup-data / EDGAR browse):
+            # slightly relaxed compared to pure fuzzy name-only matches.
+            accept = best_score >= 1.00 and (best_score - second_score >= 0.07 or best_score >= 1.15)
         else:
-            # Name-only: require stronger proof
+            # Pure fuzzy name-only: require stronger proof
             accept = best_score >= 1.05 and (best_score - second_score >= 0.08 or best_score >= 1.20)
 
         if accept:
-            return ResolutionResult(
-                cik=best_cik,
-                confidence=min(1.0, best_score / 1.35),
-                rationale=best_reason,
+            return _make_result(
+                best_cik,
+                min(1.0, best_score / 1.35),
+                best_reason,
             )
 
-        return ResolutionResult(
-            cik=None,
-            confidence=min(1.0, best_score / 1.35),
-            rationale=f"ambiguous:{best_reason}",
+        return _make_result(
+            None,
+            min(1.0, best_score / 1.35),
+            f"ambiguous:{best_reason}",
         )
 
     # ----- step 1: existing-CIK validation -----
@@ -885,6 +953,8 @@ class CIKResolver:
                     market_sector=market_sector,
                     security_type=security_type,
                     score=score,
+                    composite_figi=str(row.get("compositeFIGI") or "").strip(),
+                    share_class_figi=str(row.get("shareClassFIGI") or "").strip(),
                 ))
 
         # De-duplicate by (ticker, name) keeping highest score
@@ -1182,7 +1252,19 @@ def enrich_file(cfg: Config) -> RunSummary:
         company = CompanyRecord(raw=company_dict)
         result = resolver.resolve(company)
 
+        # Persist CIK
         company_dict["cik"] = result.cik
+        # Persist CIK resolution metadata (report §5)
+        company_dict["sec_eligible"] = bool(result.cik)
+        company_dict["cik_confidence"] = round(result.confidence, 4) if result.confidence else None
+        company_dict["cik_rationale"] = result.rationale if result.rationale else None
+        # Persist best FIGI-derived identity fields (report §5)
+        company_dict["ticker"] = result.ticker or None
+        company_dict["exchange_code"] = result.exchange_code or None
+        company_dict["composite_figi"] = result.composite_figi or None
+        company_dict["share_class_figi"] = result.share_class_figi or None
+        company_dict["security_type"] = result.security_type or None
+
         if result.cik:
             summary.resolved += 1
             logger.info(
@@ -1287,21 +1369,21 @@ class FakeSecClient:
 class FakeFigiClient:
     def __init__(self) -> None:
         self.rows: dict[tuple[str, str], list[dict[str, Any]]] = {
-            ("ID_CUSIP", "67066G104"): [{"ticker": "NVDA", "name": "NVIDIA CORP", "exchCode": "US", "marketSector": "Equity", "securityType": "Common Stock"}],
-            ("ID_ISIN", "US67066G1040"): [{"ticker": "NVDA", "name": "NVIDIA CORP", "exchCode": "US", "marketSector": "Equity", "securityType": "Common Stock"}],
-            ("ID_CUSIP", "037833100"): [{"ticker": "AAPL", "name": "APPLE INC", "exchCode": "US", "marketSector": "Equity", "securityType": "Common Stock"}],
-            ("ID_ISIN", "US0378331005"): [{"ticker": "AAPL", "name": "APPLE INC", "exchCode": "US", "marketSector": "Equity", "securityType": "Common Stock"}],
-            ("ID_CUSIP", "594918104"): [{"ticker": "MSFT", "name": "MICROSOFT CORP", "exchCode": "US", "marketSector": "Equity", "securityType": "Common Stock"}],
-            ("ID_ISIN", "US5949181045"): [{"ticker": "MSFT", "name": "MICROSOFT CORP", "exchCode": "US", "marketSector": "Equity", "securityType": "Common Stock"}],
-            ("ID_CUSIP", "023135106"): [{"ticker": "AMZN", "name": "AMAZON COM INC", "exchCode": "US", "marketSector": "Equity", "securityType": "Common Stock"}],
-            ("ID_ISIN", "US0231351067"): [{"ticker": "AMZN", "name": "AMAZON COM INC", "exchCode": "US", "marketSector": "Equity", "securityType": "Common Stock"}],
+            ("ID_CUSIP", "67066G104"): [{"ticker": "NVDA", "name": "NVIDIA CORP", "exchCode": "US", "marketSector": "Equity", "securityType": "Common Stock", "compositeFIGI": "BBG000BBJQV0", "shareClassFIGI": "BBG001S5N8V8"}],
+            ("ID_ISIN", "US67066G1040"): [{"ticker": "NVDA", "name": "NVIDIA CORP", "exchCode": "US", "marketSector": "Equity", "securityType": "Common Stock", "compositeFIGI": "BBG000BBJQV0", "shareClassFIGI": "BBG001S5N8V8"}],
+            ("ID_CUSIP", "037833100"): [{"ticker": "AAPL", "name": "APPLE INC", "exchCode": "US", "marketSector": "Equity", "securityType": "Common Stock", "compositeFIGI": "BBG000B9XRY4", "shareClassFIGI": "BBG001S5N8C4"}],
+            ("ID_ISIN", "US0378331005"): [{"ticker": "AAPL", "name": "APPLE INC", "exchCode": "US", "marketSector": "Equity", "securityType": "Common Stock", "compositeFIGI": "BBG000B9XRY4", "shareClassFIGI": "BBG001S5N8C4"}],
+            ("ID_CUSIP", "594918104"): [{"ticker": "MSFT", "name": "MICROSOFT CORP", "exchCode": "US", "marketSector": "Equity", "securityType": "Common Stock", "compositeFIGI": "BBG000BPH459", "shareClassFIGI": "BBG001S5TD05"}],
+            ("ID_ISIN", "US5949181045"): [{"ticker": "MSFT", "name": "MICROSOFT CORP", "exchCode": "US", "marketSector": "Equity", "securityType": "Common Stock", "compositeFIGI": "BBG000BPH459", "shareClassFIGI": "BBG001S5TD05"}],
+            ("ID_CUSIP", "023135106"): [{"ticker": "AMZN", "name": "AMAZON COM INC", "exchCode": "US", "marketSector": "Equity", "securityType": "Common Stock", "compositeFIGI": "BBG000BVPV84", "shareClassFIGI": "BBG001S5PQL7"}],
+            ("ID_ISIN", "US0231351067"): [{"ticker": "AMZN", "name": "AMAZON COM INC", "exchCode": "US", "marketSector": "Equity", "securityType": "Common Stock", "compositeFIGI": "BBG000BVPV84", "shareClassFIGI": "BBG001S5PQL7"}],
             ("ID_ISIN", "DE0008430026"): [
-                {"ticker": "MUV2", "name": "MUENCHENER RUECKVER AG-REG", "exchCode": "GY", "marketSector": "Equity", "securityType": "Common Stock"},
-                {"ticker": "MURGY", "name": "MUENCHENER RUCK MUNICH RE REG", "exchCode": "US", "marketSector": "Equity", "securityType": "ADR"},
+                {"ticker": "MUV2", "name": "MUENCHENER RUECKVER AG-REG", "exchCode": "GY", "marketSector": "Equity", "securityType": "Common Stock", "compositeFIGI": "BBG000BD9CM4", "shareClassFIGI": "BBG001S5XZH0"},
+                {"ticker": "MURGY", "name": "MUENCHENER RUCK MUNICH RE REG", "exchCode": "US", "marketSector": "Equity", "securityType": "ADR", "compositeFIGI": "BBG000BXKFW1", "shareClassFIGI": "BBG001S5ZDQ4"},
             ],
             ("ID_ISIN", "INE101A01026"): [
-                {"ticker": "MM", "name": "MAHINDRA & MAHINDRA LTD", "exchCode": "IB", "marketSector": "Equity", "securityType": "Common Stock"},
-                {"ticker": "MAHMF", "name": "MAHINDRA & MAHINDRA", "exchCode": "US", "marketSector": "Equity", "securityType": "Common Stock"},
+                {"ticker": "MM", "name": "MAHINDRA & MAHINDRA LTD", "exchCode": "IB", "marketSector": "Equity", "securityType": "Common Stock", "compositeFIGI": "BBG000BKQGM3", "shareClassFIGI": "BBG001S5NXR8"},
+                {"ticker": "MAHMF", "name": "MAHINDRA & MAHINDRA", "exchCode": "US", "marketSector": "Equity", "securityType": "Common Stock", "compositeFIGI": "BBG000BKQGN2", "shareClassFIGI": "BBG001S5NXS7"},
             ],
         }
 
@@ -1329,6 +1411,20 @@ def run_self_test() -> None:
         result = resolver.resolve(CompanyRecord(raw=payload))
         assert result.cik == expected_cik, f"FAIL {payload['name']}: expected={expected_cik} got={result.cik} ({result.rationale})"
         assert result.confidence > 0.75, f"FAIL {payload['name']}: low confidence {result.confidence}"
+        # Verify FIGI identity fields are populated (report §5)
+        assert result.ticker, f"FAIL {payload['name']}: missing ticker on result"
+        assert result.exchange_code, f"FAIL {payload['name']}: missing exchange_code on result"
+        assert result.security_type, f"FAIL {payload['name']}: missing security_type on result"
+        assert result.composite_figi, f"FAIL {payload['name']}: missing composite_figi on result"
+        assert result.share_class_figi, f"FAIL {payload['name']}: missing share_class_figi on result"
+
+    # --- Verify NVIDIA specifically for exact FIGI values ---
+    nvda_result = resolver.resolve(CompanyRecord(raw={
+        "name": "NVIDIA CORP", "cusip": "67066G104", "isin": "US67066G1040", "cik": None,
+    }))
+    assert nvda_result.ticker == "NVDA", f"FAIL NVDA ticker: {nvda_result.ticker}"
+    assert nvda_result.composite_figi == "BBG000BBJQV0", f"FAIL NVDA composite_figi: {nvda_result.composite_figi}"
+    assert nvda_result.share_class_figi == "BBG001S5N8V8", f"FAIL NVDA share_class_figi: {nvda_result.share_class_figi}"
 
     # --- New cases that previously failed ---
 
@@ -1340,6 +1436,8 @@ def run_self_test() -> None:
         "cik": None,
     }))
     assert result.cik == "0001076930", f"FAIL Mahindra: expected=0001076930 got={result.cik} ({result.rationale})"
+    assert result.ticker is not None, f"FAIL Mahindra: missing ticker"
+    assert result.composite_figi is not None, f"FAIL Mahindra: missing composite_figi"
 
     # Abbreviated/transliterated German name
     result = resolver.resolve(CompanyRecord(raw={
@@ -1349,6 +1447,8 @@ def run_self_test() -> None:
         "cik": None,
     }))
     assert result.cik == "0001781933", f"FAIL Munich Re: expected=0001781933 got={result.cik} ({result.rationale})"
+    assert result.ticker is not None, f"FAIL Munich Re: missing ticker"
+    assert result.composite_figi is not None, f"FAIL Munich Re: missing composite_figi"
 
     # --- Verify normalization helpers ---
     assert normalize_name("MAHINDRA &amp; MAHINDRA") == "MAHINDRA MAHINDRA"
@@ -1377,8 +1477,8 @@ def run_self_test() -> None:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Resolve SEC CIKs for companies in a YAML file")
-    parser.add_argument("--input", dest="input_path", type=Path, default=Path("../data/parsed_invesco-ftse-all-world/2026-03-31__Die_10_groessten_Positionen-holdings.yaml"), help="Input YAML path")
-    parser.add_argument("--output", dest="output_path", type=Path, default=Path("../data/enriched_invesco-ftse-all-world/2026-03-31__Die_10_groessten_Positionen-holdings.yaml"), help="Output YAML path")
+    parser.add_argument("--input", dest="input_path", type=Path, default=Path("../data/parsed_invesco-ftse-all-world/2026_04_02_watchlist.yaml"), help="Input YAML path")
+    parser.add_argument("--output", dest="output_path", type=Path, default=Path("../data/enriched_invesco-ftse-all-world/2026_04_02_watchlist.yaml"), help="Output YAML path")
     parser.add_argument("--cache-dir", dest="cache_dir", type=Path, default=Path("../data/.cik_cache"))
     parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
     parser.add_argument("--log-path", type=Path)

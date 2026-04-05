@@ -1,5 +1,6 @@
 """Convert an ETF constituents spreadsheet to a structured YAML file."""
 import logging
+import os
 import re
 import sys
 import warnings
@@ -47,6 +48,9 @@ _ISIN_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{10}$")
 HEADER_SKIP_ROWS = 4          # data starts at row index 4 (0-based)
 COLUMN_NAMES = ["name", "cusip", "isin", "weight"]
 
+SCHEMA_VERSION = 2
+SOURCE_ETF = "INVESCO FTSE ALL-WORLD ETF"
+
 # ---------------------------------------------------------------------------
 # Models – input
 # ---------------------------------------------------------------------------
@@ -76,33 +80,47 @@ class RawConstituent:
 
 
 # ---------------------------------------------------------------------------
-# Models – output
+# Models – output  (report.md §2: CompanyRef reference-universe schema)
 # ---------------------------------------------------------------------------
 
 @dataclass
-class Company:
-    """Output schema for a single ETF constituent."""
-    cik: None = None
-    ticker: None = None
-    cusip: Optional[str] = None
+class CompanyRef:
+    """Output schema for a single ETF constituent.
+
+    Reference-universe schema (report §2).  Mutable snapshot fields
+    (market_cap, revenue, ADV, sector/industry) are deliberately excluded
+    and belong in a separate dated-snapshot file.
+    """
+    # --- core identifiers ---
     isin: str = ""
-    name: str = ""
-    exchange: None = None
-    sector: None = None
-    industry: None = None
-    market_cap_b: None = None
-    revenue_ttm_b: None = None
-    index: None = None
-    weight_pct: None = None
-    avg_daily_vol_m: None = None
+    cusip: Optional[str] = None
+    raw_name: str = ""              # original spreadsheet name
+    name: str = ""                  # normalized name for matching
     weight: float = 0.0
+
+    # --- CIK / SEC fields (populated by cik_enricher) ---
+    cik: Optional[str] = None
+    sec_eligible: bool = False
+    cik_confidence: Optional[float] = None
+    cik_rationale: Optional[str] = None
+
+    # --- FIGI identity fields (populated by cik_enricher) ---
+    ticker: Optional[str] = None        # not unique by itself
+    exchange_code: Optional[str] = None
+    composite_figi: Optional[str] = None
+    share_class_figi: Optional[str] = None
+    security_type: Optional[str] = None
 
 # ---------------------------------------------------------------------------
 # Name cleaning
 # ---------------------------------------------------------------------------
 
 def clean_name(raw: str) -> str:
-    """Strip par-value suffixes and share-class markers from raw constituent names."""
+    """Strip par-value suffixes and share-class markers from raw constituent names.
+
+    This is the normalisation step used for matching; the original name
+    is preserved as ``raw_name``.
+    """
     name = _PAR_VALUE_RE.sub("", raw)
     name = _ADR_SUFFIX_RE.sub("", name)
     name = _PRF_SUFFIX_RE.sub("", name)
@@ -114,6 +132,8 @@ def clean_name(raw: str) -> str:
 
 def read_constituents(path: Path) -> List[RawConstituent]:
     logger.info("Reading constituents from %s", path)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"File not found: {path}")
     df = pd.read_excel(path, skiprows=HEADER_SKIP_ROWS, header=None, names=COLUMN_NAMES)
     df = df.dropna(subset=["isin"])
     logger.info("Found %d rows with ISIN values", len(df))
@@ -148,17 +168,35 @@ def check_duplicates(rows: List[RawConstituent]) -> None:
 # Transform
 # ---------------------------------------------------------------------------
 
-def to_companies(rows: List[RawConstituent]) -> List[Company]:
+def to_companies(rows: List[RawConstituent]) -> List[CompanyRef]:
+    """Build CompanyRef entries from raw constituents.
+
+    Populates ``raw_name`` (original) and ``name`` (cleaned/normalised).
+    All enrichment fields are left at their defaults (None / False).
+    """
     logger.info("Building company entries for %d constituents", len(rows))
     return [
-        Company(
+        CompanyRef(
             cusip=r.cusip,
             isin=r.isin,
+            raw_name=r.name,
             name=clean_name(r.name),
             weight=r.weight,
         )
         for r in rows
     ]
+
+# ---------------------------------------------------------------------------
+# as_of_date extraction
+# ---------------------------------------------------------------------------
+
+def _extract_as_of_date(path: Path) -> str:
+    """Extract the date prefix from a filename like '2026-03-31__...xlsx'.
+
+    Returns the date string or an empty string if not found.
+    """
+    match = re.match(r"(\d{4}-\d{2}-\d{2})", path.name)
+    return match.group(1) if match else ""
 
 # ---------------------------------------------------------------------------
 # Write YAML (with blank lines between entries)
@@ -168,13 +206,21 @@ def _none_representer(dumper: yaml.Dumper, _data: None) -> yaml.Node:
     return dumper.represent_scalar("tag:yaml.org,2002:null", "null")
 
 
-def write_yaml(companies: List[Company], path: Path) -> None:
+def write_yaml(companies: List[CompanyRef], path: Path, *, as_of_date: str = "") -> None:
+    """Write company list to YAML with file-level metadata (report §2)."""
     logger.info("Writing %d companies to %s", len(companies), path)
     dumper = yaml.Dumper
     dumper.add_representer(type(None), _none_representer)
 
-    # Dump each company individually, then join with blank lines
-    header = "companies:\n"
+    # File-level metadata (report §2)
+    header_lines = [
+        f"schema_version: {SCHEMA_VERSION}",
+        f'source_etf: "{SOURCE_ETF}"',
+        f'as_of_date: "{as_of_date}"',
+        "companies:",
+    ]
+    header = "\n".join(header_lines) + "\n"
+
     blocks: List[str] = []
     for company in companies:
         d = asdict(company)
@@ -199,6 +245,13 @@ def validate_output(path: Path, expected_count: int) -> None:
     with open(path) as f:
         loaded = yaml.safe_load(f)
 
+    # Validate file-level metadata
+    assert loaded.get("schema_version") == SCHEMA_VERSION, (
+        f"Expected schema_version={SCHEMA_VERSION}, got {loaded.get('schema_version')}"
+    )
+    assert "source_etf" in loaded, "Missing 'source_etf' metadata"
+    assert "as_of_date" in loaded, "Missing 'as_of_date' metadata"
+
     companies = loaded.get("companies", [])
     assert len(companies) == expected_count, (
         f"Expected {expected_count} companies, got {len(companies)}"
@@ -206,6 +259,7 @@ def validate_output(path: Path, expected_count: int) -> None:
     for i, c in enumerate(companies):
         assert "isin" in c and c["isin"], f"Company #{i} missing ISIN"
         assert "cusip" in c, f"Company #{i} missing CUSIP field"
+        assert "raw_name" in c and c["raw_name"], f"Company #{i} missing raw_name"
         assert "name" in c and c["name"], f"Company #{i} missing name"
         assert "weight" in c and isinstance(c["weight"], (int, float)), (
             f"Company #{i} has invalid weight: {c.get('weight')}"
@@ -216,14 +270,17 @@ def validate_output(path: Path, expected_count: int) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+INPUT_FNAME = "Die_10_groessten_Positionen-holdings.xlsx"
+OUTPUT_FNAME = "{scrape_date}_watchlist.yaml" # TODO fix below to use this output name
+
 def main() -> None:
     input_base = Path("../data/scrape_invesco-ftse-all-world/")
     output_dir = Path("../data/parsed_invesco-ftse-all-world/")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    for date_dir in sorted(input_base.glob("[0-9][0-9][0-9][0-9]_[0-9][0-9]_[0-9][0-9]")):
-        for input_path in sorted(date_dir.glob("[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]__*.xlsx")):
-            output_path = output_dir / input_path.with_suffix(".yaml").name
+    for date_dir in sorted(input_base.glob("[0-9][0-9][0-9][0-9]_[0-9][0-9]_[0-9][0-9]")): # for all scrape days
+        for input_path in sorted(date_dir.glob(INPUT_FNAME)):
+            output_path = output_dir / OUTPUT_FNAME.format(scrape_date=date_dir.name)
 
             if output_path.exists():
                 logger.info("Skipping %s — output already exists", input_path.name)
@@ -233,7 +290,8 @@ def main() -> None:
             rows = read_constituents(input_path)
             check_duplicates(rows)
             companies = to_companies(rows)
-            write_yaml(companies, output_path)
+            as_of_date = _extract_as_of_date(input_path)
+            write_yaml(companies, output_path, as_of_date=as_of_date)
             validate_output(output_path, expected_count=len(companies))
             logger.info("Done — %d companies written to %s", len(companies), output_path.name)
 
