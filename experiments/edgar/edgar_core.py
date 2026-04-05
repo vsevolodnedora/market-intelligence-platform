@@ -675,34 +675,135 @@ _WATCHLIST_REQUIRED = {"cik", "ticker", "name"}
 def load_watchlist_yaml(path: Path) -> list[WatchlistCompany]:
     raw = yaml.safe_load(path.read_text())
     if not isinstance(raw, dict) or "companies" not in raw:
-        raise ValueError(f"Watchlist YAML must have a top-level 'companies' key: {path}")
+        raise ValueError(
+            f"Watchlist YAML must have a top-level 'companies' key: {path}"
+        )
     entries = raw["companies"]
     if not isinstance(entries, list):
         raise ValueError(f"'companies' must be a list: {path}")
+
     companies: list[WatchlistCompany] = []
     seen_ciks: set[str] = set()
+    skipped_missing = 0
+    skipped_invalid_cik = 0
+    skipped_duplicate = 0
+
     for i, entry in enumerate(entries):
         if not isinstance(entry, dict):
-            raise ValueError(f"Entry {i} is not a mapping: {entry!r}")
+            logger.warning(
+                "watchlist entry %d is not a mapping, skipping: %r",
+                i,
+                entry,
+            )
+            skipped_missing += 1
+            continue
+
+        # --- Check for missing or empty mandatory fields -----------------
+        entry_name = entry.get("name") or entry.get("raw_name") or ""
+        entry_label = entry_name or f"<entry {i}>"
+
         missing = _WATCHLIST_REQUIRED - entry.keys()
         if missing:
-            raise ValueError(f"Entry {i} missing required fields {missing}: {entry!r}")
-        cik = _validate_cik(str(entry["cik"]))
+            logger.warning(
+                "watchlist entry %d (%s) missing required fields %s, skipping",
+                i,
+                entry_label,
+                missing,
+            )
+            skipped_missing += 1
+            continue
+
+        raw_cik = entry.get("cik")
+        if raw_cik is None or str(raw_cik).strip() in ("", "None", "null"):
+            logger.warning(
+                "watchlist entry %d (%s) has no CIK (non-SEC), skipping for EDGAR monitoring",
+                i,
+                entry_label,
+            )
+            skipped_invalid_cik += 1
+            continue
+
+        try:
+            cik = _validate_cik(str(raw_cik))
+        except (ValueError, TypeError) as exc:
+            logger.warning(
+                "watchlist entry %d (%s) has invalid CIK %r: %s, skipping",
+                i,
+                entry_label,
+                raw_cik,
+                exc,
+            )
+            skipped_invalid_cik += 1
+            continue
+
+        # Ticker may be None for entries enriched from a global ETF universe
+        raw_ticker = entry.get("ticker")
+        if not raw_ticker or str(raw_ticker).strip() in ("", "None", "null"):
+            logger.warning(
+                "watchlist entry %d (%s, CIK=%s) has no ticker, skipping",
+                i,
+                entry_label,
+                cik,
+            )
+            skipped_missing += 1
+            continue
+
+        raw_name = str(entry.get("name") or "").strip()
+        if not raw_name:
+            logger.warning(
+                "watchlist entry %d (CIK=%s) has empty name, skipping",
+                i,
+                cik,
+            )
+            skipped_missing += 1
+            continue
+
+        # Duplicate CIK
         if cik in seen_ciks:
+            logger.warning(
+                "watchlist entry %d (%s) has duplicate CIK %s, skipping",
+                i,
+                entry_label,
+                cik,
+            )
+            skipped_duplicate += 1
             continue
         seen_ciks.add(cik)
-        extra = {k: v for k, v in entry.items() if k not in _WATCHLIST_REQUIRED and k != "isin" and k != "aliases"}
-        # Parse aliases from watchlist entries.
+
+        # Build valid entry
+        extra = {
+            k: v
+            for k, v in entry.items()
+            if k not in _WATCHLIST_REQUIRED and k != "isin" and k != "aliases"
+        }
         raw_aliases = entry.get("aliases", [])
         if isinstance(raw_aliases, str):
             raw_aliases = [raw_aliases]
         aliases = tuple(str(a) for a in raw_aliases if a)
-        companies.append(WatchlistCompany(
-            cik=cik, ticker=str(entry["ticker"]),
-            name=str(entry["name"]), aliases=aliases, metadata=extra,
-        ))
+
+        companies.append(
+            WatchlistCompany(
+                cik=cik,
+                ticker=str(raw_ticker),
+                name=raw_name,
+                aliases=aliases,
+                metadata=extra,
+            )
+        )
+
+    if skipped_missing or skipped_invalid_cik or skipped_duplicate:
+        logger.info(
+            "watchlist filtering: skipped %d missing-fields, %d invalid/absent CIK, "
+            "%d duplicate CIK out of %d total entries",
+            skipped_missing,
+            skipped_invalid_cik,
+            skipped_duplicate,
+            len(entries),
+        )
+
     if not companies:
-        raise ValueError(f"Watchlist is empty: {path}")
+        raise ValueError(f"Watchlist has no valid entries for EDGAR monitoring: {path}")
+
     logger.info("loaded %d unique companies from watchlist %s", len(companies), path)
     return companies
 

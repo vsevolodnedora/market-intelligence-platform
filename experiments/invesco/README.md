@@ -11,13 +11,13 @@ companies:
   - isin: "..."
     cusip: "..."
     raw_name: "..."           # original spreadsheet name
-    name: "..."               # normalised for matching
+    name: "..."               # normalised for matching [Req. for EDGER]
     weight: 0.0
-    cik: "..."                # SEC filer ID (null if non-SEC)
+    cik: "..."                # SEC filer ID (null if non-SEC) [Req. for EDGER]
     sec_eligible: false
     cik_confidence: null
     cik_rationale: null
-    ticker: null              # from OpenFIGI
+    ticker: null              # from OpenFIGI [Req. for EDGER]
     exchange_code: null       # from OpenFIGI
     composite_figi: null      # from OpenFIGI
     share_class_figi: null    # from OpenFIGI
