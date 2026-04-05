@@ -97,32 +97,47 @@ def _copy_and_verify(
 ) -> tuple[bool, str]:
     """Copy *src* to *dst* byte-identically and verify the hash.
 
+    Uses streaming reads and a single pass to avoid holding entire files
+    in memory twice (extension_plan2 §8).
+
     Returns (success, sha256_hex_of_copy).  If *expected_sha256* is
     provided and does not match, returns (False, actual_hash).
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
+    _CHUNK = 256 * 1024  # 256 KiB
 
-    # Read source and compute hash
-    src_data = src.read_bytes()
-    actual_hash = sha256_hex(src_data)
-
-    if expected_sha256 and actual_hash != expected_sha256:
-        logger.error(
-            "hash mismatch BEFORE copy: src=%s expected=%s actual=%s",
-            src, expected_sha256, actual_hash,
-        )
-        return False, actual_hash
-
-    # Write to temp file, fsync, rename (atomic on same filesystem)
+    # Phase 1: Stream source → temp file, computing hash on the fly
     import tempfile
+    src_hasher = hashlib.sha256()
     fd, tmp_path = tempfile.mkstemp(
         dir=str(dst.parent), prefix=".archiving_", suffix=dst.suffix,
     )
     try:
-        os.write(fd, src_data)
+        with open(src, "rb") as fin:
+            while True:
+                chunk = fin.read(_CHUNK)
+                if not chunk:
+                    break
+                src_hasher.update(chunk)
+                os.write(fd, chunk)
         os.fsync(fd)
         os.close(fd)
         fd = -1
+
+        actual_hash = src_hasher.hexdigest()
+
+        if expected_sha256 and actual_hash != expected_sha256:
+            logger.error(
+                "hash mismatch BEFORE copy: src=%s expected=%s actual=%s",
+                src, expected_sha256, actual_hash,
+            )
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return False, actual_hash
+
+        # Atomic rename
         os.rename(tmp_path, str(dst))
         # Fsync parent directory
         dir_fd = os.open(str(dst.parent), os.O_RDONLY)
@@ -139,9 +154,16 @@ def _copy_and_verify(
             pass
         raise
 
-    # Verify the written copy
-    verify_data = dst.read_bytes()
-    verify_hash = sha256_hex(verify_data)
+    # Phase 2: Streaming verify of the written copy
+    verify_hasher = hashlib.sha256()
+    with open(dst, "rb") as fout:
+        while True:
+            chunk = fout.read(_CHUNK)
+            if not chunk:
+                break
+            verify_hasher.update(chunk)
+    verify_hash = verify_hasher.hexdigest()
+
     if verify_hash != actual_hash:
         logger.error(
             "hash mismatch AFTER copy: dst=%s expected=%s actual=%s",
@@ -160,6 +182,18 @@ def _safe_delete(path: Path) -> bool:
     except OSError as exc:
         logger.warning("failed to delete %s: %s", path, exc)
         return False
+
+
+def _streaming_sha256(path: Path) -> str:
+    """Compute SHA-256 of a file using streaming reads (avoids full in-memory)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(256 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +307,7 @@ def archive_filing(
         if dst.exists():
             # Already archived — just verify
             if expected_hash:
-                existing_hash = sha256_hex(dst.read_bytes())
+                existing_hash = _streaming_sha256(dst)
                 if existing_hash != expected_hash:
                     logger.error(
                         "existing archive file hash mismatch: %s expected=%s actual=%s",
@@ -318,7 +352,7 @@ def archive_filing(
 
         if dst.exists():
             if doc_sha:
-                existing_hash = sha256_hex(dst.read_bytes())
+                existing_hash = _streaming_sha256(dst)
                 if existing_hash != doc_sha:
                     logger.error(
                         "filing_documents archive hash mismatch: %s", local_path,
@@ -391,18 +425,25 @@ def archive_filing(
 def _atomic_copy(src: Path, dst: Path) -> str:
     """Copy *src* to *dst* using temp-file → fsync → rename (Issue #7).
 
+    Uses streaming reads to avoid holding the entire file in memory.
     Returns the sha256 hex digest of the copied bytes.
     """
     import tempfile
+    _CHUNK = 256 * 1024
     dst.parent.mkdir(parents=True, exist_ok=True)
-    src_data = src.read_bytes()
-    src_hash = sha256_hex(src_data)
 
+    hasher = hashlib.sha256()
     fd, tmp_path = tempfile.mkstemp(
         dir=str(dst.parent), prefix=".jsonl_archiving_", suffix=dst.suffix,
     )
     try:
-        os.write(fd, src_data)
+        with open(src, "rb") as fin:
+            while True:
+                chunk = fin.read(_CHUNK)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                os.write(fd, chunk)
         os.fsync(fd)
         os.close(fd)
         fd = -1
@@ -422,7 +463,7 @@ def _atomic_copy(src: Path, dst: Path) -> str:
             pass
         raise
 
-    return src_hash
+    return hasher.hexdigest()
 
 
 def archive_jsonl_events(
@@ -460,8 +501,8 @@ def archive_jsonl_events(
             # Without this check, a corrupt archive copy would cause the
             # only good data to be destroyed (extension plan §3C).
             if not dry_run:
-                src_hash = sha256_hex(f.read_bytes())
-                dst_hash = sha256_hex(dst.read_bytes())
+                src_hash = _streaming_sha256(f)
+                dst_hash = _streaming_sha256(dst)
                 if src_hash != dst_hash:
                     logger.error(
                         "JSONL archive integrity mismatch for %s: "
@@ -487,15 +528,13 @@ def archive_jsonl_events(
 
         if dry_run:
             logger.info("[DRY RUN] would archive JSONL %s → %s", f, dst)
-            # Dry-run fix: do NOT increment jsonl_files_archived — nothing
-            # was actually archived.  The old code overstated dry-run stats.
             continue
 
         try:
             src_hash = _atomic_copy(f, dst)
 
             # Verify the archive copy
-            verify_hash = sha256_hex(dst.read_bytes())
+            verify_hash = _streaming_sha256(dst)
             if verify_hash != src_hash:
                 logger.error("JSONL archive hash mismatch: %s", f.name)
                 try:
@@ -591,7 +630,7 @@ def cleanup_orphaned_originals(
                 continue
 
             if expected_hash:
-                actual_hash = sha256_hex(archived_path.read_bytes())
+                actual_hash = _streaming_sha256(archived_path)
                 if actual_hash != expected_hash:
                     logger.warning(
                         "cleanup: archive hash mismatch for %s (%s) — keeping original",
@@ -731,7 +770,7 @@ def build_parser() -> argparse.ArgumentParser:
              "failed deletions.  Defaults to <db_path>/../raw/ if it exists.",
     )
     p.add_argument(
-        "--retention-days", type=int, default=30,
+        "--retention-days", type=int, default=14,
         help="Only archive filings older than this many days",
     )
     p.add_argument(

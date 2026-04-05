@@ -348,23 +348,17 @@ class OutboxStore:
             return True
 
     def mark_failed(self, event_id: str, error: str, lease_token: str | None = None) -> bool:
-        """Record a publish failure with exponential backoff for next attempt."""
+        """Record a publish failure with exponential backoff for next attempt.
+
+        When a ``lease_token`` is provided, the update is guarded by
+        ``status = 'leased' AND lease_token = ?`` in a **single** UPDATE
+        statement — matching the ``mark_published()`` pattern.  This
+        prevents the stale-lease TOCTOU race described in extension_plan2
+        §5: a stale publisher can no longer pass a SELECT check, lose
+        ownership, and then overwrite a now-published row.
+        """
         now = utcnow()
         with self.storage._conn() as conn:
-            # Verify lease ownership first if token provided
-            if lease_token is not None:
-                check = conn.execute(
-                    "SELECT 1 FROM outbox_events WHERE event_id = ? AND status = 'leased' AND lease_token = ?",
-                    (event_id, lease_token),
-                ).fetchone()
-                if check is None:
-                    logger.warning(
-                        "mark_failed: stale lease for event_id=%s (token mismatch or expired)",
-                        event_id,
-                    )
-                    conn.commit()
-                    return False
-
             row = conn.execute(
                 "SELECT publish_attempts FROM outbox_events WHERE event_id = ?",
                 (event_id,),
@@ -377,14 +371,33 @@ class OutboxStore:
                 new_status = "pending"
                 backoff = min(3600, self._publish_retry_base * (2 ** attempts))
                 next_at = (now + timedelta(seconds=backoff)).isoformat()
-            conn.execute(
-                """UPDATE outbox_events
-                   SET status = ?, publish_attempts = ?, last_error = ?,
-                       next_attempt_at = ?, leased_at = NULL, lease_token = NULL
-                   WHERE event_id = ?""",
-                (new_status, attempts, error[:1000], next_at, event_id),
-            )
-            conn.commit()
+
+            if lease_token is not None:
+                # Single conditional UPDATE — no separate pre-check.
+                cursor = conn.execute(
+                    """UPDATE outbox_events
+                       SET status = ?, publish_attempts = ?, last_error = ?,
+                           next_attempt_at = ?, leased_at = NULL, lease_token = NULL
+                       WHERE event_id = ? AND status = 'leased' AND lease_token = ?""",
+                    (new_status, attempts, error[:1000], next_at, event_id, lease_token),
+                )
+                conn.commit()
+                if cursor.rowcount == 0:
+                    logger.warning(
+                        "mark_failed: stale lease for event_id=%s (token mismatch or expired)",
+                        event_id,
+                    )
+                    return False
+            else:
+                # Backward-compatible path (no lease verification).
+                conn.execute(
+                    """UPDATE outbox_events
+                       SET status = ?, publish_attempts = ?, last_error = ?,
+                           next_attempt_at = ?, leased_at = NULL, lease_token = NULL
+                       WHERE event_id = ?""",
+                    (new_status, attempts, error[:1000], next_at, event_id),
+                )
+                conn.commit()
             return True
 
     def reset_stale_leases(self, stale_seconds: int = 120) -> int:

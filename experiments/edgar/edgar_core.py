@@ -2150,23 +2150,59 @@ class SQLiteStorage:
         self, accession: str, state: RelevanceState,
         *, issuer_cik: str | None = None, issuer_name: str | None = None,
     ) -> None:
+        """Update a filing's relevance state.
+
+        When setting a **terminal** header-gate outcome (``hdr_failed`` or
+        ``unresolved``), also resets ``retrieval_status`` back to
+        ``discovered`` so that stale ``queued`` status cannot cause the
+        filing to be replayed into retrieval by ``list_stranded_work()``
+        or startup replay.  This closes the state-machine bug described
+        in extension_plan2 §3.
+        """
         now = utcnow().isoformat()
+        # Terminal header-gate outcomes must clear retrieval_status to
+        # prevent stranded-work replay from sending them into retrieval.
+        _terminal_hdr_states = (
+            RelevanceState.HDR_FAILED.value,
+            RelevanceState.UNRESOLVED.value,
+        )
+        reset_retrieval = state.value in _terminal_hdr_states
         with self._conn() as conn:
             if issuer_cik or issuer_name:
-                conn.execute(
-                    """UPDATE filings SET relevance_state=?, issuer_cik=COALESCE(?,issuer_cik),
-                       issuer_name=COALESCE(?,issuer_name),
-                       issuer_name_normalized=COALESCE(?,issuer_name_normalized),
-                       updated_at=? WHERE accession_number=?""",
-                    (state.value, issuer_cik, issuer_name,
-                     normalize_name(issuer_name) if issuer_name else None,
-                     now, accession),
-                )
+                if reset_retrieval:
+                    conn.execute(
+                        """UPDATE filings SET relevance_state=?,
+                           retrieval_status='discovered',
+                           issuer_cik=COALESCE(?,issuer_cik),
+                           issuer_name=COALESCE(?,issuer_name),
+                           issuer_name_normalized=COALESCE(?,issuer_name_normalized),
+                           updated_at=? WHERE accession_number=?""",
+                        (state.value, issuer_cik, issuer_name,
+                         normalize_name(issuer_name) if issuer_name else None,
+                         now, accession),
+                    )
+                else:
+                    conn.execute(
+                        """UPDATE filings SET relevance_state=?, issuer_cik=COALESCE(?,issuer_cik),
+                           issuer_name=COALESCE(?,issuer_name),
+                           issuer_name_normalized=COALESCE(?,issuer_name_normalized),
+                           updated_at=? WHERE accession_number=?""",
+                        (state.value, issuer_cik, issuer_name,
+                         normalize_name(issuer_name) if issuer_name else None,
+                         now, accession),
+                    )
             else:
-                conn.execute(
-                    "UPDATE filings SET relevance_state=?, updated_at=? WHERE accession_number=?",
-                    (state.value, now, accession),
-                )
+                if reset_retrieval:
+                    conn.execute(
+                        "UPDATE filings SET relevance_state=?, retrieval_status='discovered', "
+                        "updated_at=? WHERE accession_number=?",
+                        (state.value, now, accession),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE filings SET relevance_state=?, updated_at=? WHERE accession_number=?",
+                        (state.value, now, accession),
+                    )
             conn.commit()
 
     def set_hdr_transient_fail(
@@ -2466,9 +2502,13 @@ class SQLiteStorage:
         """Return filings that are actually retryable.
 
         Only includes retrieval_failed and retrieved_partial rows that:
-          - have a relevant or pending relevance state (not irrelevant/unmatched)
+          - have a relevant or pending relevance state (not terminal)
           - have not exceeded the max attempt count
           - whose next_retry_at has passed (or is NULL for legacy rows)
+
+        Excludes terminal relevance states (irrelevant, direct_unmatched,
+        hdr_failed, unresolved) — these should never be retried for
+        retrieval (extension_plan2 §3).
         """
         with self._conn() as conn:
             rows = conn.execute(
@@ -2477,7 +2517,7 @@ class SQLiteStorage:
                 "attempt_count "
                 "FROM filings "
                 "WHERE retrieval_status IN ('retrieval_failed','retrieved_partial') "
-                "AND relevance_state NOT IN ('irrelevant','direct_unmatched') "
+                "AND relevance_state NOT IN ('irrelevant','direct_unmatched','hdr_failed','unresolved') "
                 "AND attempt_count < ? "
                 "AND (next_retry_at IS NULL OR next_retry_at <= ?) "
                 "ORDER BY updated_at ASC LIMIT ?",
@@ -2565,8 +2605,12 @@ class SQLiteStorage:
         indefinitely because the existing retry scanner only looks at
         *failed* statuses.
 
-        Excludes ``hdr_pending`` relevance state — those are already covered
-        by ``list_hdr_pending``.
+        Excludes relevance states that should never enter retrieval:
+          - ``hdr_pending`` — covered by ``list_hdr_pending``
+          - ``hdr_transient_fail`` — covered by ``list_hdr_transient_fail``
+          - ``irrelevant``, ``direct_unmatched`` — no retrieval needed
+          - ``hdr_failed``, ``unresolved`` — terminal header-gate outcomes
+            that must not be replayed into retrieval (extension_plan2 §3)
         """
         with self._conn() as conn:
             rows = conn.execute(
@@ -2575,7 +2619,7 @@ class SQLiteStorage:
                 "attempt_count "
                 "FROM filings "
                 "WHERE retrieval_status IN ('queued','in_progress') "
-                "AND relevance_state NOT IN ('irrelevant','direct_unmatched','hdr_pending','hdr_transient_fail') "
+                "AND relevance_state NOT IN ('irrelevant','direct_unmatched','hdr_pending','hdr_transient_fail','hdr_failed','unresolved') "
                 "ORDER BY updated_at ASC LIMIT ?",
                 (limit,),
             ).fetchall()

@@ -411,14 +411,21 @@ class FilingRetriever:
                     pdoc_body_text: str | None = None
                     if extracted_bytes is not None:
                         pdoc_body_text = extracted_bytes.decode("utf-8", errors="replace")
+                    # Use discovery.filing_date when available, but fall back
+                    # to the SGML header's filed_as_of_date for bootstrap/
+                    # backfill filings where the discovery object may not have
+                    # a filing date.  Without this fallback, all 8-K item
+                    # events from backfill have filing_date=null.
+                    effective_filing_date: str | None = None
+                    if discovery.filing_date:
+                        effective_filing_date = discovery.filing_date.isoformat()
+                    elif header.filed_as_of_date:
+                        effective_filing_date = header.filed_as_of_date
                     eight_k_events = parse_8k_items(
                         header, acc,
                         company_name=discovery.company_name,
                         cik=cik,
-                        filing_date=(
-                            discovery.filing_date.isoformat()
-                            if discovery.filing_date else None
-                        ),
+                        filing_date=effective_filing_date,
                         primary_doc_body=pdoc_body_text,
                     ) or None
                 except Exception:
@@ -666,6 +673,7 @@ class IngestionDaemon:
             asyncio.create_task(self._consumer_loop(self._hist_queue), name="hist_consumer"),
             asyncio.create_task(self._atom_poller(), name="atom_poller"),
             asyncio.create_task(self._retry_scanner(), name="retry_scanner"),
+            asyncio.create_task(self._stranded_scanner(), name="stranded_scanner"),
             asyncio.create_task(self._daily_reconciler(), name="reconciler"),
             asyncio.create_task(self._outbox_publisher(), name="outbox_publisher"),
             asyncio.create_task(self._weekly_repair(), name="weekly_repair"),
@@ -940,6 +948,23 @@ class IngestionDaemon:
             logger.debug("retrieval skip (already retrieved): acc=%s kind=%s", acc, item.kind)
             return
 
+        # --- Fix §3: refuse retrieval if relevance state is terminal ---
+        # A filing whose header-gate resolved to hdr_failed, unresolved,
+        # irrelevant, or direct_unmatched should never enter retrieval.
+        # This guards against stale queue entries or replay races.
+        _NON_RETRIEVAL_RELEVANCE = frozenset({
+            RelevanceState.HDR_FAILED.value,
+            RelevanceState.UNRESOLVED.value,
+            RelevanceState.IRRELEVANT.value,
+            RelevanceState.DIRECT_UNMATCHED.value,
+        })
+        if existing.relevance_state in _NON_RETRIEVAL_RELEVANCE:
+            logger.info(
+                "retrieval skip (terminal relevance): acc=%s relevance=%s kind=%s",
+                acc, existing.relevance_state, item.kind,
+            )
+            return
+
         if item.kind == "retry":
             if existing.retrieval_status not in (
                 RetrievalStatus.RETRIEVAL_FAILED.value,
@@ -960,14 +985,17 @@ class IngestionDaemon:
         await self.storage.set_retrieval_in_progress(acc)
         logger.info("retrieval starting: acc=%s kind=%s", acc, item.kind)
         t0 = _time.monotonic()
-        await self.retriever.retrieve_full(discovery)
+        success = await self.retriever.retrieve_full(discovery)
         elapsed = _time.monotonic() - t0
-        # Track end-to-end latency from enqueue to event commit.
-        # item.created_at is monotonic time at enqueue — measures total
-        # pipeline latency including any queue wait time.
-        pipeline_latency = _time.monotonic() - item.created_at
-        METRICS.record_discovery_to_event_latency(pipeline_latency)
         METRICS.observe("edgar_retrieval_duration_seconds", elapsed)
+        if success:
+            # Track end-to-end latency from enqueue to event commit — only
+            # on success so SLA dashboards aren't blurred by failure events
+            # (extension_plan2 §9).
+            pipeline_latency = _time.monotonic() - item.created_at
+            METRICS.record_discovery_to_event_latency(pipeline_latency)
+        else:
+            METRICS.inc("edgar_retrieval_failed_events_total")
         # Wake the outbox publisher so new events are published immediately
         # instead of waiting for the next poll cycle.
         self._outbox_wake.set()
@@ -1316,6 +1344,78 @@ class IngestionDaemon:
                     )
             except Exception:
                 logger.exception("error in retry scanner")
+
+    # --- Fast stranded-work scanner (Fix §4) ---
+
+    async def _stranded_scanner(self) -> None:
+        """Frequent scanner for filings stranded by queue saturation.
+
+        Runs every 10 seconds and re-enqueues ``queued`` filings that are
+        not currently in-flight.  This closes the liveness gap described in
+        extension_plan2 §4: when ``_enqueue()`` fails due to queue pressure,
+        the filing remains ``queued`` in SQLite but has no in-memory
+        representation.  Without this scanner, such filings would only be
+        recovered by startup replay or weekly repair — far too slow for a
+        latency-sensitive signal system.
+
+        This deliberately overlaps with the retry scanner and weekly repair;
+        the per-accession in-flight guard prevents duplicate work.
+        """
+        while not self._shutdown.is_set():
+            await asyncio.sleep(10.0)
+            try:
+                stranded = await self.storage.list_stranded_work(limit=50)
+                if not stranded:
+                    continue
+                enqueued = 0
+                for record in stranded:
+                    async with self._inflight_lock:
+                        if record.accession_number in self._inflight:
+                            continue
+                    d = FilingDiscovery(
+                        accession_number=record.accession_number,
+                        archive_cik=record.archive_cik,
+                        form_type=record.form_type,
+                        company_name=record.company_name,
+                        source="stranded_scanner",
+                        complete_txt_url=derive_complete_txt_url(
+                            record.archive_cik, record.accession_number,
+                        ),
+                        hdr_sgml_url=derive_hdr_sgml_url(
+                            record.archive_cik, record.accession_number,
+                        ),
+                    )
+                    # Route based on relevance state: hdr_match/direct_match → retrieval,
+                    # hdr_pending → header_gate, else → discovery for re-classification.
+                    if record.relevance_state in (
+                        RelevanceState.DIRECT_MATCH.value,
+                        RelevanceState.HDR_MATCH.value,
+                    ):
+                        await self.storage.set_retrieval_queued(record.accession_number, force=True)
+                        ok = await self._enqueue(make_work(
+                            "retrieval", d.accession_number,
+                            FilingPriority.RETRY, discovery=d,
+                        ))
+                    elif record.relevance_state == RelevanceState.HDR_PENDING.value:
+                        await self.storage.set_retrieval_queued(record.accession_number, force=True)
+                        ok = await self._enqueue(make_work(
+                            "header_gate", d.accession_number,
+                            FilingPriority.HEADER_GATE, discovery=d,
+                        ))
+                    else:
+                        ok = await self._enqueue(make_work(
+                            "discovery", d.accession_number,
+                            FilingPriority.RETRY, discovery=d,
+                        ))
+                    if ok:
+                        enqueued += 1
+                if enqueued:
+                    logger.info(
+                        "stranded scanner: re-enqueued %d/%d stranded filings",
+                        enqueued, len(stranded),
+                    )
+            except Exception:
+                logger.exception("error in stranded scanner")
 
     # --- Issuer audit ---
 
