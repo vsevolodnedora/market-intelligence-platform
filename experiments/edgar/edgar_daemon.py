@@ -257,12 +257,17 @@ class FilingRetriever:
 
     def __init__(self, client: SECClient, storage: SQLiteStorage, raw_dir: Path,
                  retry_base_seconds: float = 2.0,
-                 commit_service: FilingCommitService | None = None) -> None:
+                 commit_service: FilingCommitService | None = None,
+                 out_form4_transactions_cap:int = 20,
+                 out_form4_owners_cap = 10
+    ) -> None:
         self.client = client
         self.storage = storage
         self.raw_dir = raw_dir
         self.retry_base_seconds = retry_base_seconds
         self.commit_service = commit_service
+        self.out_form4_transactions_cap = out_form4_transactions_cap
+        self.out_form4_owners_cap = out_form4_owners_cap
         self._artifact_writer = ArtifactWriter()
 
     async def fetch_header_only(self, discovery: FilingDiscovery) -> SubmissionHeader:
@@ -453,6 +458,8 @@ class FilingRetriever:
                     form4=form4,
                     eight_k_events=eight_k_events,
                     retry_base_seconds=self.retry_base_seconds,
+                    out_form4_transactions_cap = self.out_form4_transactions_cap,
+                    out_form4_owners_cap = self.out_form4_owners_cap,
                 )
             else:
                 # Legacy path: separate storage calls (no outbox) — also offloaded
@@ -560,6 +567,8 @@ class IngestionDaemon:
             client, storage, settings.raw_dir,
             retry_base_seconds=settings.retry_base_seconds,
             commit_service=self.commit_service,
+            out_form4_transactions_cap = self.settings.out_form4_transactions_cap,
+            out_form4_owners_cap = self.settings.out_form4_owners_cap
         )
         self.header_resolver = HeaderResolver(watchlist)
 

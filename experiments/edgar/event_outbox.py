@@ -525,10 +525,12 @@ def build_filing_retrieved_event(
 def build_form4_event(
     accession_number: str,
     form4: Form4Filing,
+    out_form4_transactions_cap:int = 20,
+    out_form4_owners_cap:int = 10,
 ) -> EventEnvelope:
     # Build compact transaction summaries for downstream consumers
     txn_summaries = []
-    for txn in form4.transactions[:20]:  # Cap at 20 to bound payload size
+    for txn in form4.transactions[:out_form4_transactions_cap]:  # Cap at N to bound payload size
         txn_summaries.append({
             "security_title": txn.security_title,
             "transaction_date": txn.transaction_date,
@@ -540,7 +542,7 @@ def build_form4_event(
             "is_derivative": txn.is_derivative,
         })
     owner_summaries = []
-    for owner in form4.reporting_owners[:10]:
+    for owner in form4.reporting_owners[:out_form4_owners_cap]:
         owner_summaries.append({
             "cik": owner.get("cik") if isinstance(owner, dict) else getattr(owner, "cik", None),
             "name": owner.get("name") if isinstance(owner, dict) else getattr(owner, "name", None),
@@ -783,6 +785,9 @@ class FilingCommitService:
         eight_k_events: list[EightKEvent] | None = None,
         # Retry config
         retry_base_seconds: float = 2.0,
+        # Form 4 output caps
+        out_form4_transactions_cap : int = 20,
+        out_form4_owners_cap : int = 10,
     ) -> list[EventEnvelope]:
         """Commit all filing data + outbox events in a single transaction.
 
@@ -810,7 +815,7 @@ class FilingCommitService:
             header_form_type=header.form_type,
         ))
         if form4 and (form4.transactions or form4.holdings):
-            envelopes.append(build_form4_event(accession_number, form4))
+            envelopes.append(build_form4_event(accession_number, form4, out_form4_transactions_cap, out_form4_owners_cap))
         if eight_k_events:
             envelopes.extend(build_8k_events(accession_number, eight_k_events))
 

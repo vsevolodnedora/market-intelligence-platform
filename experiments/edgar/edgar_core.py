@@ -277,6 +277,9 @@ class Settings:
     publish_dir: Path | None = None  # Dir for JSON-lines event publishing
     live_workers: int = 3  # Number of concurrent live-lane consumers
     live_rps_share: float = 0.6  # Fraction of max_rps reserved for live lane
+    # --- Form properties
+    out_form4_transactions_cap : int = 20
+    out_form4_owners_cap : int = 10
     # --- Metrics (optional observability layer) ---
     metrics_enabled: bool = False
     metrics_host: str = "127.0.0.1"
