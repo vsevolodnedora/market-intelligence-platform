@@ -261,14 +261,19 @@ class FilingRetriever:
                     if artifact:
                         self.storage.attach_artifact(artifact)
                     # Delegate form-specific persistence to handlers
+                    # Use a proper context-managed connection so the
+                    # handler writes are transactional and the connection
+                    # is always closed
                     for handler in self.form_registry.handlers:
                         handler_name = type(handler).__name__
                         if handler_name in bundle.form_results:
-                            handler.persist(
-                                self.storage._conn().__enter__(),
-                                acc, bundle.form_results[handler_name],
-                                utcnow().isoformat(),
-                            )
+                            with self.storage._conn() as conn:
+                                handler.persist(
+                                    conn,
+                                    acc, bundle.form_results[handler_name],
+                                    utcnow().isoformat(),
+                                )
+                                conn.commit()
                     final_status_inner = "retrieved" if pdoc_path_str else "retrieved_partial"
                     self.storage.update_retrieval_status(
                         acc, final_status_inner,

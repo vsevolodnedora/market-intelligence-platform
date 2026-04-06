@@ -479,9 +479,6 @@ def archive_jsonl_events(
     writes to the current UTC-day file, so touching today's file would
     race with live append/fsync behavior.
 
-    Issue #7 fix: Uses atomic temp → fsync → rename instead of
-    ``shutil.copy2()`` so archival durability matches live-write patterns.
-
     This is entirely file-level — no DB changes.
     """
     if not publish_dir.exists():
@@ -690,7 +687,7 @@ def run_archival(
     )
 
     # Phase 1: Archive filing artifacts
-    # Pass archive_dir so already-archived filings are excluded (§3A fix).
+    # Pass archive_dir so already-archived filings are excluded
     eligible = storage.list_archival_eligible(
         retention_days=retention_days,
         limit=batch_size,

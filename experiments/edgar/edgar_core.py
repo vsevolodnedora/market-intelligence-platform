@@ -103,6 +103,7 @@ from sec_io import (  # noqa: F401
     AsyncTokenBucket,
     HTTPTransport,
     MockTransport,
+    PooledTransport,
     SECClient,
     SECHTTPError,
     SECResponseFormatError,

@@ -40,7 +40,7 @@ def load_watchlist_yaml(path: Path) -> list[WatchlistCompany]:
         raise ValueError(f"'companies' must be a list: {path}")
 
     companies: list[WatchlistCompany] = []
-    seen_ciks: set[str] = set()
+    seen_ciks: dict[str, WatchlistCompany] = {}
     skipped_missing = 0
     skipped_invalid_cik = 0
     skipped_duplicate = 0
@@ -115,17 +115,21 @@ def load_watchlist_yaml(path: Path) -> list[WatchlistCompany]:
             skipped_missing += 1
             continue
 
-        # Duplicate CIK
+        # Duplicate CIK — keep the first entry, skip subsequent duplicates
         if cik in seen_ciks:
+            first = seen_ciks[cik]
             logger.warning(
-                "watchlist entry %d (%s) has duplicate CIK %s, skipping",
+                "watchlist entry %d has duplicate CIK %s: "
+                "'%s' (ticker=%s) duplicates kept entry '%s' (ticker=%s), skipping",
                 i,
-                entry_label,
                 cik,
+                entry_label,
+                raw_ticker,
+                first.name,
+                first.ticker,
             )
             skipped_duplicate += 1
             continue
-        seen_ciks.add(cik)
 
         # Build valid entry
         extra = {
@@ -138,15 +142,15 @@ def load_watchlist_yaml(path: Path) -> list[WatchlistCompany]:
             raw_aliases = [raw_aliases]
         aliases = tuple(str(a) for a in raw_aliases if a)
 
-        companies.append(
-            WatchlistCompany(
-                cik=cik,
-                ticker=str(raw_ticker),
-                name=raw_name,
-                aliases=aliases,
-                metadata=extra,
-            )
+        company = WatchlistCompany(
+            cik=cik,
+            ticker=str(raw_ticker),
+            name=raw_name,
+            aliases=aliases,
+            metadata=extra,
         )
+        seen_ciks[cik] = company
+        companies.append(company)
 
     if skipped_missing or skipped_invalid_cik or skipped_duplicate:
         logger.info(
@@ -239,4 +243,3 @@ class HeaderResolver:
                 return RelevanceState.HDR_MATCH, match, canonical
 
         return RelevanceState.IRRELEVANT, None, canonical
-

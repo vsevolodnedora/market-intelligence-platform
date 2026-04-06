@@ -695,7 +695,6 @@ class IngestionDaemon:
             logger.debug("retrieval skip (already retrieved): acc=%s kind=%s", acc, item.kind)
             return
 
-        # --- Fix §3: refuse retrieval if relevance state is terminal ---
         # A filing whose header-gate resolved to hdr_failed, unresolved,
         # irrelevant, or direct_unmatched should never enter retrieval.
         # This guards against stale queue entries or replay races.
@@ -1092,14 +1091,12 @@ class IngestionDaemon:
             except Exception:
                 logger.exception("error in retry scanner")
 
-    # --- Fast stranded-work scanner (Fix §4) ---
-
+    # --- Fast stranded-work scanner
     async def _stranded_scanner(self) -> None:
         """Frequent scanner for filings stranded by queue saturation.
 
         Runs every 10 seconds and re-enqueues ``queued`` filings that are
-        not currently in-flight.  This closes the liveness gap described in
-        extension_plan2 §4: when ``_enqueue()`` fails due to queue pressure,
+        not currently in-flight.  This closes the liveness gap when ``_enqueue()`` fails due to queue pressure,
         the filing remains ``queued`` in SQLite but has no in-memory
         representation.  Without this scanner, such filings would only be
         recovered by startup replay or weekly repair — far too slow for a
@@ -1346,7 +1343,7 @@ class IngestionDaemon:
         Per-issuer failures are logged and tracked; the overall flag remains
         ``false`` until all issuers pass.
 
-        Issue #4 fix: If the initial bootstrap has failures, retries every
+        If the initial bootstrap has failures, retries every
         30 minutes inside the running process instead of requiring a restart.
         """
         _BOOTSTRAP_RETRY_INTERVAL = 1800  # 30 minutes
@@ -1372,7 +1369,7 @@ class IngestionDaemon:
             self._bootstrap_done.set()
             logger.info("bootstrap done event set — issuer audit unblocked")
 
-        # --- Issue 4 fix: periodic retry for failed bootstrap ---
+        # Reriodic retry for failed bootstrap
         retry_count = 0
         while not all_success and not self._shutdown.is_set():
             retry_count += 1
@@ -1904,7 +1901,7 @@ async def _run(settings: Settings, watchlist: list[WatchlistCompany]) -> None:
 
     index = WatchlistIndex(watchlist)
 
-    # --- Issue 3 fix: separate rate limiters for live and historical lanes ---
+    # Separate rate limiters for live and historical lanes ---
     # Live lane gets a protected share of SEC request capacity so that
     # historical backfill/audit/reconcile can never starve live discovery
     # and retrieval.

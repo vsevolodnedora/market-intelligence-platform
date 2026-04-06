@@ -228,6 +228,22 @@ class SQLiteStorage:
                     ON form4_holdings(issuer_ticker);
                 CREATE INDEX IF NOT EXISTS idx_form4_holdings_owner
                     ON form4_holdings(reporting_owner_cik);
+
+                -- Retry/replay indexes: these predicates are hit repeatedly
+                -- by the daemon's retry, transient-fail, stranded-work, and
+                -- unprocessed-discovery scanners.  Without indexes, these
+                -- scans become increasingly expensive as history grows (§3.10).
+                CREATE INDEX IF NOT EXISTS idx_filings_retry
+                    ON filings(retrieval_status, next_retry_at)
+                    WHERE retrieval_status IN ('retrieval_failed', 'retrieved_partial');
+                CREATE INDEX IF NOT EXISTS idx_filings_relevance_updated
+                    ON filings(relevance_state, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_filings_retrieval_updated
+                    ON filings(retrieval_status, updated_at)
+                    WHERE retrieval_status IN ('queued', 'in_progress');
+                CREATE INDEX IF NOT EXISTS idx_filings_archival
+                    ON filings(retrieval_status, updated_at)
+                    WHERE retrieval_status = 'retrieved';
             """)
             conn.commit()
 

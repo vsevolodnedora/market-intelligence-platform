@@ -118,7 +118,139 @@ class HTTPTransport(Protocol):
     ) -> tuple[int, bytes, dict[str, str]]: ...
 
 
+class PooledTransport:
+    """Connection-pooled HTTP transport with TLS session reuse.
+
+    Uses **thread-local** connection pools so that each executor thread
+    maintains its own ``http.client.HTTPS/HTTPConnection`` per host.
+    This is critical because ``http.client`` connections are **not**
+    thread-safe — their internal state machine (Idle → Request-sent →
+    response-ready) corrupts if two threads interleave ``request()``
+    and ``getresponse()`` on the same object.
+
+    Since ``asyncio.to_thread`` dispatches to a reusable thread pool,
+    connections are still reused across requests within the same thread,
+    giving us both connection reuse *and* zero-contention correctness.
+
+    The SSL context is shared (it *is* thread-safe) so TLS session
+    tickets are reused across all threads.
+    """
+
+    def __init__(
+        self,
+        timeout: float = 20.0,
+        max_reuses: int = 100,
+    ) -> None:
+        import http.client
+        import threading
+        from urllib.parse import urlparse as _urlparse
+
+        self.timeout = timeout
+        self.max_reuses = max_reuses
+        self._ssl_ctx = ssl.create_default_context()
+        self._local = threading.local()
+        self._http_client = http.client
+        self._urlparse = _urlparse
+
+    def _thread_pool(self) -> dict[str, tuple[Any, int]]:
+        """Return the per-thread connection pool, creating it if needed."""
+        pool = getattr(self._local, "pool", None)
+        if pool is None:
+            pool = {}
+            self._local.pool = pool
+        return pool
+
+    def _get_conn(self, host: str, port: int, scheme: str) -> Any:
+        """Get or create a persistent connection for this thread + host."""
+        pool = self._thread_pool()
+        key = f"{scheme}://{host}:{port}"
+
+        entry = pool.get(key)
+        if entry is not None:
+            conn, reuses = entry
+            if reuses < self.max_reuses:
+                pool[key] = (conn, reuses + 1)
+                return conn
+            # Exceeded reuse limit — close and create fresh
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        if scheme == "https":
+            conn = self._http_client.HTTPSConnection(
+                host, port, timeout=self.timeout, context=self._ssl_ctx,
+            )
+        else:
+            conn = self._http_client.HTTPConnection(
+                host, port, timeout=self.timeout,
+            )
+        pool[key] = (conn, 1)
+        return conn
+
+    def _evict_conn(self, host: str, port: int, scheme: str) -> None:
+        """Remove a stale connection from this thread's pool."""
+        pool = self._thread_pool()
+        key = f"{scheme}://{host}:{port}"
+        entry = pool.pop(key, None)
+        if entry:
+            try:
+                entry[0].close()
+            except Exception:
+                pass
+
+    def _do_request_sync(
+        self, method: str, url: str, headers: dict[str, str],
+    ) -> tuple[int, bytes, dict[str, str]]:
+        parsed = self._urlparse(url)
+        scheme = parsed.scheme or "https"
+        host = parsed.hostname or ""
+        port = parsed.port or (443 if scheme == "https" else 80)
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+
+        for attempt in range(2):  # retry once on stale connection
+            conn = self._get_conn(host, port, scheme)
+            try:
+                conn.request(method, path, headers=headers)
+                resp = conn.getresponse()
+                body = resp.read()
+                resp_headers = {k.lower(): v for k, v in resp.getheaders()}
+                return resp.status, body, resp_headers
+            except (
+                ConnectionError, OSError, self._http_client.HTTPException,
+            ):
+                self._evict_conn(host, port, scheme)
+                if attempt == 0:
+                    continue  # transparent retry on stale connection
+                raise
+
+        raise IOError(f"Failed to connect to {host}:{port}")
+
+    async def request(
+        self, method: str, url: str, headers: dict[str, str],
+    ) -> tuple[int, bytes, dict[str, str]]:
+        status, body, resp_headers = await asyncio.to_thread(
+            self._do_request_sync, method, url, headers,
+        )
+        encoding = resp_headers.get("content-encoding", "").lower()
+        if encoding == "gzip":
+            body = gzip.decompress(body)
+        elif encoding == "deflate":
+            try:
+                body = zlib.decompress(body)
+            except zlib.error:
+                body = zlib.decompress(body, -zlib.MAX_WBITS)
+        return status, body, resp_headers
+
+
 class UrllibTransport:
+    """Legacy per-request transport.  Retained for backward compatibility.
+
+    For lower-latency operation, prefer ``PooledTransport`` which reuses
+    TCP connections and TLS sessions across requests.
+    """
     def __init__(self, timeout: float = 20.0) -> None:
         self.timeout = timeout
 
@@ -191,7 +323,7 @@ class SECClient:
     ) -> None:
         self.settings = settings
         self.rate_limiter = rate_limiter or AsyncTokenBucket(settings.max_rps)
-        self._transport = transport or UrllibTransport(timeout=settings.http_timeout_seconds)
+        self._transport = transport or PooledTransport(timeout=settings.http_timeout_seconds)
         self._headers = {
             "User-Agent": settings.user_agent,
             "Accept-Encoding": "gzip, deflate",
@@ -722,4 +854,3 @@ def normalized_header_metadata(header: SubmissionHeader) -> dict[str, object]:
             for d in header.documents
         ],
     }
-

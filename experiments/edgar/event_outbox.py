@@ -86,12 +86,28 @@ class EventSubjects:
 
 @dataclass(slots=True)
 class EventEnvelope:
-    """Normalised domain event ready for outbox insertion."""
+    """Normalised domain event ready for outbox insertion.
+
+    **Delivery semantics (at-least-once):**
+    The default JSONL publisher writes to disk *before* marking the outbox
+    row as published.  If the process crashes between those two steps, the
+    event will be re-leased and appended again on restart.  Downstream
+    consumers **must** treat ``event_id`` as a hard idempotency key and
+    deduplicate accordingly.
+
+    **Correction semantics:**
+    When a filing is re-parsed and the payload changes, a new revision of
+    the same ``event_id`` is emitted.  The ``payload_hash`` field allows
+    the outbox to detect changed payloads and re-queue previously-published
+    events for republication.  Consumers should use the highest
+    ``commit_seq`` for a given ``event_id`` as the authoritative version.
+    """
     event_id: str
     subject: str
     accession_number: str
     payload: dict[str, Any]
     created_at: str  # ISO-8601
+    payload_hash: str = ""  # SHA-256 of canonical payload JSON
     lease_token: str | None = None  # Set during lease_pending()
     commit_seq: int | None = None   # DB-assigned monotonic sequence
 
@@ -113,12 +129,15 @@ class EventEnvelope:
             event_id = hashlib.sha256(raw.encode()).hexdigest()[:32]
         else:
             event_id = uuid.uuid4().hex
+        payload_json = dump_json(payload)
+        payload_hash = hashlib.sha256(payload_json.encode()).hexdigest()[:16]
         return EventEnvelope(
             event_id=event_id,
             subject=subject,
             accession_number=accession_number,
             payload=payload,
             created_at=utcnow().isoformat(),
+            payload_hash=payload_hash,
         )
 
 
@@ -133,6 +152,7 @@ CREATE TABLE IF NOT EXISTS outbox_events (
     accession_number TEXT NOT NULL,
     subject TEXT NOT NULL,
     payload_json TEXT NOT NULL,
+    payload_hash TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'pending',
     publish_attempts INTEGER NOT NULL DEFAULT 0,
     next_attempt_at TEXT,
@@ -197,6 +217,11 @@ class OutboxStore:
             # (desirable: old events publish first via COALESCE in lease_pending).
             conn.execute("ALTER TABLE outbox_events ADD COLUMN commit_seq INTEGER")
             logger.info("outbox migration: added commit_seq column")
+        if "payload_hash" not in cols:
+            conn.execute(
+                "ALTER TABLE outbox_events ADD COLUMN payload_hash TEXT NOT NULL DEFAULT ''"
+            )
+            logger.info("outbox migration: added payload_hash column for correction semantics")
         # Ensure monotonic commit_seq index exists
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_outbox_commit_seq "
@@ -208,46 +233,80 @@ class OutboxStore:
     def insert_event(self, conn: sqlite3.Connection, envelope: EventEnvelope) -> None:
         """Insert a single outbox event — caller must commit.
 
-        Uses INSERT OR IGNORE on the UNIQUE(event_id) constraint so that
-        duplicate events are silently skipped.  After insert, the DB-assigned
-        ``commit_seq`` is written back onto the envelope for downstream use.
+        **Correction semantics:** If an event with the same ``event_id``
+        already exists but the ``payload_hash`` differs (i.e. a reparse
+        produced different data), the existing row is updated with the new
+        payload and reset to ``pending`` so downstream consumers receive
+        the corrected version.  If the payload is unchanged, the row is
+        left as-is (idempotent no-op).
 
-        On fresh schemas ``commit_seq`` is the INTEGER PRIMARY KEY
-        AUTOINCREMENT and is assigned automatically.  On migrated schemas
-        (where event_id was the original PK) ``commit_seq`` is a plain
-        INTEGER column — in that case we explicitly compute the next value.
+        After insert/update, the DB-assigned ``commit_seq`` is written
+        back onto the envelope for downstream use.
         """
-        # Try the insert — commit_seq auto-increments on fresh schemas.
-        conn.execute(
-            """INSERT OR IGNORE INTO outbox_events
-               (event_id, accession_number, subject, payload_json,
-                status, publish_attempts, created_at)
-               VALUES (?, ?, ?, ?, 'pending', 0, ?)""",
-            (
-                envelope.event_id,
-                envelope.accession_number,
-                envelope.subject,
-                dump_json(envelope.payload),
-                envelope.created_at,
-            ),
-        )
-        # For migrated schemas where commit_seq is a plain column (not PK),
-        # it will be NULL after the insert above.  Backfill it from the max.
-        row = conn.execute(
-            "SELECT commit_seq FROM outbox_events WHERE event_id = ?",
+        payload_json = dump_json(envelope.payload)
+        payload_hash = envelope.payload_hash or hashlib.sha256(payload_json.encode()).hexdigest()[:16]
+
+        # Check if this event_id already exists
+        existing = conn.execute(
+            "SELECT commit_seq, payload_hash, status FROM outbox_events WHERE event_id = ?",
             (envelope.event_id,),
         ).fetchone()
-        if row and row[0] is None:
-            next_seq = conn.execute(
-                "SELECT COALESCE(MAX(commit_seq), 0) + 1 FROM outbox_events"
-            ).fetchone()[0]
+
+        if existing is None:
+            # Fresh insert — commit_seq auto-increments on fresh schemas.
             conn.execute(
-                "UPDATE outbox_events SET commit_seq = ? WHERE event_id = ?",
-                (next_seq, envelope.event_id),
+                """INSERT INTO outbox_events
+                   (event_id, accession_number, subject, payload_json, payload_hash,
+                    status, publish_attempts, created_at)
+                   VALUES (?, ?, ?, ?, ?, 'pending', 0, ?)""",
+                (
+                    envelope.event_id,
+                    envelope.accession_number,
+                    envelope.subject,
+                    payload_json,
+                    payload_hash,
+                    envelope.created_at,
+                ),
             )
-            envelope.commit_seq = next_seq
-        elif row:
-            envelope.commit_seq = row[0]
+            # For migrated schemas where commit_seq is a plain column (not PK),
+            # it will be NULL after the insert above.  Backfill it from the max.
+            row = conn.execute(
+                "SELECT commit_seq FROM outbox_events WHERE event_id = ?",
+                (envelope.event_id,),
+            ).fetchone()
+            if row and row[0] is None:
+                next_seq = conn.execute(
+                    "SELECT COALESCE(MAX(commit_seq), 0) + 1 FROM outbox_events"
+                ).fetchone()[0]
+                conn.execute(
+                    "UPDATE outbox_events SET commit_seq = ? WHERE event_id = ?",
+                    (next_seq, envelope.event_id),
+                )
+                envelope.commit_seq = next_seq
+            elif row:
+                envelope.commit_seq = row[0]
+        else:
+            # Event already exists — check for correction
+            old_hash = existing["payload_hash"] if existing["payload_hash"] else ""
+            if old_hash != payload_hash:
+                # Payload changed: update and re-queue for publication.
+                conn.execute(
+                    """UPDATE outbox_events
+                       SET payload_json = ?, payload_hash = ?,
+                           status = 'pending', publish_attempts = 0,
+                           published_at = NULL, last_error = NULL,
+                           next_attempt_at = NULL, leased_at = NULL,
+                           lease_token = NULL, created_at = ?
+                       WHERE event_id = ?""",
+                    (payload_json, payload_hash, envelope.created_at, envelope.event_id),
+                )
+                logger.info(
+                    "correction detected for event_id=%s subject=%s: "
+                    "payload changed (old_hash=%s new_hash=%s), re-queued",
+                    envelope.event_id, envelope.subject, old_hash, payload_hash,
+                )
+            # else: identical payload — idempotent no-op
+            envelope.commit_seq = existing["commit_seq"]
 
     def insert_events(self, conn: sqlite3.Connection, envelopes: list[EventEnvelope]) -> None:
         """Insert multiple outbox events — caller must commit."""
@@ -283,7 +342,7 @@ class OutboxStore:
             # where commit_seq may be NULL.
             candidates = conn.execute(
                 """SELECT commit_seq, event_id, accession_number, subject,
-                          payload_json, created_at
+                          payload_json, payload_hash, created_at
                    FROM outbox_events
                    WHERE status = 'pending'
                      AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
@@ -308,6 +367,7 @@ class OutboxStore:
                         accession_number=row["accession_number"],
                         payload=json.loads(row["payload_json"]),
                         created_at=row["created_at"],
+                        payload_hash=row["payload_hash"] or "",
                         lease_token=token,
                         commit_seq=row["commit_seq"],
                     ))
@@ -477,7 +537,11 @@ class ArtifactWriter:
 
 
 # ---------------------------------------------------------------------------
-# Event construction helpers
+# Event construction helpers — single source of truth in event_builders.py
+#
+# These thin wrappers use lazy imports to avoid circular dependencies
+# (event_builders imports EventEnvelope from this module).  All event
+# construction logic lives exclusively in event_builders.py.
 # ---------------------------------------------------------------------------
 
 def build_filing_retrieved_event(
@@ -485,108 +549,28 @@ def build_filing_retrieved_event(
     archive_cik: str,
     form_type: str,
     company_name: str,
-    *,
-    issuer_cik: str | None = None,
-    issuer_name: str | None = None,
-    status: str = "retrieved",
-    txt_sha256: str | None = None,
-    primary_sha256: str | None = None,
-    primary_document_url: str | None = None,
-    acceptance_datetime: str | None = None,
-    filing_date: str | None = None,
-    header_form_type: str | None = None,
+    **kwargs: Any,
 ) -> EventEnvelope:
-    subject = (
-        EventSubjects.FILING_RETRIEVED
-        if status == "retrieved"
-        else EventSubjects.FILING_PARTIAL
-    )
-    return EventEnvelope.new(
-        subject=subject,
-        accession_number=accession_number,
-        payload={
-            "archive_cik": archive_cik,
-            "form_type": form_type,
-            "company_name": company_name,
-            "issuer_cik": issuer_cik,
-            "issuer_name": issuer_name,
-            "status": status,
-            "txt_sha256": txt_sha256,
-            "primary_sha256": primary_sha256,
-            "primary_document_url": primary_document_url,
-            "acceptance_datetime": acceptance_datetime,
-            "filing_date": filing_date,
-            "header_form_type": header_form_type,
-        },
-        business_key=accession_number,
-    )
+    from event_builders import build_filing_retrieved_event as _impl
+    return _impl(accession_number, archive_cik, form_type, company_name, **kwargs)
 
 
 def build_form4_event(
     accession_number: str,
     form4: Form4Filing,
-    out_form4_transactions_cap:int = 20,
-    out_form4_owners_cap:int = 10,
+    out_form4_transactions_cap: int = 20,
+    out_form4_owners_cap: int = 10,
 ) -> EventEnvelope:
-    # Build compact transaction summaries for downstream consumers
-    txn_summaries = []
-    for txn in form4.transactions[:out_form4_transactions_cap]:  # Cap at N to bound payload size
-        txn_summaries.append({
-            "security_title": txn.security_title,
-            "transaction_date": txn.transaction_date,
-            "transaction_code": txn.transaction_code,
-            "shares": txn.shares,
-            "price_per_share": txn.price_per_share,
-            "acquired_disposed": txn.acquired_disposed,
-            "shares_owned_after": txn.shares_owned_after,
-            "is_derivative": txn.is_derivative,
-        })
-    owner_summaries = []
-    for owner in form4.reporting_owners[:out_form4_owners_cap]:
-        owner_summaries.append({
-            "cik": owner.get("cik") if isinstance(owner, dict) else getattr(owner, "cik", None),
-            "name": owner.get("name") if isinstance(owner, dict) else getattr(owner, "name", None),
-            "is_director": owner.get("is_director", False) if isinstance(owner, dict) else getattr(owner, "is_director", False),
-            "is_officer": owner.get("is_officer", False) if isinstance(owner, dict) else getattr(owner, "is_officer", False),
-            "officer_title": owner.get("officer_title") if isinstance(owner, dict) else getattr(owner, "officer_title", None),
-            "is_ten_pct_owner": owner.get("is_ten_pct_owner", False) if isinstance(owner, dict) else getattr(owner, "is_ten_pct_owner", False),
-        })
-    return EventEnvelope.new(
-        subject=EventSubjects.FORM4_PARSED,
-        accession_number=accession_number,
-        payload={
-            "issuer_cik": form4.issuer_cik,
-            "issuer_name": form4.issuer_name,
-            "issuer_ticker": form4.issuer_ticker,
-            "transaction_count": len(form4.transactions),
-            "holding_count": len(form4.holdings),
-            "owner_count": len(form4.reporting_owners),
-            "transactions": txn_summaries,
-            "reporting_owners": owner_summaries,
-        },
-        business_key=accession_number,
-    )
+    from event_builders import build_form4_event as _impl
+    return _impl(accession_number, form4, out_form4_transactions_cap, out_form4_owners_cap)
 
 
 def build_8k_events(
     accession_number: str,
     events: list[EightKEvent],
 ) -> list[EventEnvelope]:
-    return [
-        EventEnvelope.new(
-            subject=EventSubjects.EIGHT_K_ITEM,
-            accession_number=accession_number,
-            payload={
-                "item_number": ev.item_number,
-                "item_description": ev.item_description,
-                "company_name": ev.company_name,
-                "cik": ev.cik,
-                "filing_date": ev.filing_date,
-            },
-            business_key=f"{accession_number}:{ev.item_number}",
-        )
-        for ev in events
-    ]
+    from event_builders import build_8k_events as _impl
+    return _impl(accession_number, events)
 
 
 def build_filing_failed_event(
@@ -596,31 +580,16 @@ def build_filing_failed_event(
     error: str,
     attempt_no: int = 1,
 ) -> EventEnvelope:
-    return EventEnvelope.new(
-        subject=EventSubjects.FILING_FAILED,
-        accession_number=accession_number,
-        payload={
-            "archive_cik": archive_cik,
-            "form_type": form_type,
-            "error": error[:500],
-            "attempt_no": attempt_no,
-        },
-        business_key=f"{accession_number}:{attempt_no}",
-    )
+    from event_builders import build_filing_failed_event as _impl
+    return _impl(accession_number, archive_cik, form_type, error, attempt_no)
 
 
 def build_feed_gap_event(
     watermark_ts: str,
     pages_checked: int,
 ) -> EventEnvelope:
-    return EventEnvelope.new(
-        subject=EventSubjects.FEED_GAP,
-        accession_number="N/A",
-        payload={
-            "watermark_ts": watermark_ts,
-            "pages_checked": pages_checked,
-        },
-    )
+    from event_builders import build_feed_gap_event as _impl
+    return _impl(watermark_ts, pages_checked)
 
 
 # ---------------------------------------------------------------------------
@@ -653,6 +622,19 @@ def _jsonl_write_sync(
             os.close(dir_fd)
 
 
+def _event_date_str(envelope: EventEnvelope) -> str:
+    """Extract the date portion of an event's created_at for file partitioning.
+
+    Uses the event's commit timestamp rather than the current wall-clock
+    so that delayed publications land in the correct day-partition.
+    Falls back to UTC now if created_at is unparseable.
+    """
+    try:
+        return envelope.created_at[:10]  # "YYYY-MM-DD" prefix of ISO-8601
+    except (TypeError, IndexError):
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
 async def jsonl_publish_callback(
     envelope: EventEnvelope,
     publish_dir: Path,
@@ -664,16 +646,26 @@ async def jsonl_publish_callback(
     Downstream consumers (e.g. an execution layer process on the same VM)
     can tail or inotify-watch the directory for new lines.
 
+    **At-least-once delivery:** The JSONL append + fsync happens *before*
+    the outbox row is marked published.  A crash between those two steps
+    will cause the event to be re-appended on restart.  Consumers MUST
+    deduplicate by ``event_id``.
+
+    Day-partitioning is based on the event's ``created_at`` timestamp
+    (commit time), not the current clock, so delayed publications land
+    in the semantically correct partition.
+
     All blocking I/O (open, write, flush, fsync) is offloaded to a thread
     via ``asyncio.to_thread`` so the event loop is never stalled.
     """
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    target = publish_dir / f"events-{today_str}.jsonl"
+    day_str = _event_date_str(envelope)
+    target = publish_dir / f"events-{day_str}.jsonl"
     line = json.dumps({
         "event_id": envelope.event_id,
         "subject": envelope.subject,
         "accession_number": envelope.accession_number,
         "payload": envelope.payload,
+        "payload_hash": envelope.payload_hash,
         "created_at": envelope.created_at,
         "commit_seq": envelope.commit_seq,
     }, separators=(",", ":"), sort_keys=True)
@@ -684,41 +676,46 @@ async def jsonl_publish_batch_callback(
     envelopes: list[EventEnvelope],
     publish_dir: Path,
 ) -> None:
-    """Batch-write multiple events with a single fsync — thread-offloaded.
+    """Batch-write multiple events with a single fsync per day-file.
 
     More efficient than per-event fsync under burst load while still
-    guaranteeing durability for the entire batch.
+    guaranteeing durability for the entire batch.  Events are grouped
+    by their ``created_at`` date so each lands in the correct partition.
     """
     if not envelopes:
         return
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    target = publish_dir / f"events-{today_str}.jsonl"
-    lines = []
+    # Group events by their semantic day (created_at, not publish time)
+    by_day: dict[str, list[str]] = {}
     for envelope in envelopes:
-        lines.append(json.dumps({
+        day_str = _event_date_str(envelope)
+        line = json.dumps({
             "event_id": envelope.event_id,
             "subject": envelope.subject,
             "accession_number": envelope.accession_number,
             "payload": envelope.payload,
+            "payload_hash": envelope.payload_hash,
             "created_at": envelope.created_at,
             "commit_seq": envelope.commit_seq,
-        }, separators=(",", ":"), sort_keys=True))
+        }, separators=(",", ":"), sort_keys=True)
+        by_day.setdefault(day_str, []).append(line)
 
     def _write_batch() -> None:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        is_new_file = not target.exists()
-        with open(target, "a", encoding="utf-8") as f:
-            for ln in lines:
-                f.write(ln + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        # Fsync parent directory when creating a new day-file
-        if is_new_file:
-            dir_fd = os.open(str(target.parent), os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+        publish_dir.mkdir(parents=True, exist_ok=True)
+        for day_str, lines in by_day.items():
+            target = publish_dir / f"events-{day_str}.jsonl"
+            is_new_file = not target.exists()
+            with open(target, "a", encoding="utf-8") as f:
+                for ln in lines:
+                    f.write(ln + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            # Fsync parent directory when creating a new day-file
+            if is_new_file:
+                dir_fd = os.open(str(target.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
 
     await _asyncio.to_thread(_write_batch)
 
