@@ -15,6 +15,7 @@ from domain import (
     EightKExhibitFact,
     Form4Filing,
     ThirteenFFiling,
+    ThirteenFNoticeFiling,
     ThirteenDGFiling,
     XBRLFiling,
     FundFiling,
@@ -222,6 +223,30 @@ def build_13f_event(
                 }
                 for h in top_holdings
             ],
+        },
+        business_key=accession_number,
+    )
+
+
+def build_13f_notice_event(
+    accession_number: str,
+    filing: ThirteenFNoticeFiling,
+) -> EventEnvelope:
+    """Build an event for a 13F-NT notice filing.
+
+    Unlike the holdings event, the notice payload contains only filer
+    identity and report period — there are no holdings to include.
+    """
+    return EventEnvelope.new(
+        subject=EventSubjects.THIRTEEN_F_NT_PARSED,
+        accession_number=accession_number,
+        payload={
+            "filer_cik": filing.filer_cik,
+            "filer_name": filing.filer_name,
+            "report_period": filing.report_period,
+            "filing_type": filing.filing_type,
+            "filing_date": filing.filing_date,
+            "is_amendment": filing.is_amendment,
         },
         business_key=accession_number,
     )

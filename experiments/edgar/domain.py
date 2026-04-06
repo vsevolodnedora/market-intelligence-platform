@@ -117,23 +117,35 @@ OWNERSHIP_FORMS = frozenset({"3", "4", "5", "3/A", "4/A", "5/A"})
 _OWNERSHIP_FORM_RE = re.compile(r"^(?:3|4|5)(?:/A)?$", re.IGNORECASE)
 ACTIVIST_FORMS = frozenset({"SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A", "13D", "13G"})
 
-# 13F form matching
+# 13F form matching — split into HR (holdings report) and NT (notice)
+# so each form family gets its own handler and semantic model.
 _13F_FORM_RE = re.compile(r"^13F-(?:HR|NT)(?:/A)?$", re.IGNORECASE)
+_13F_HR_FORM_RE = re.compile(r"^13F-HR(?:/A)?$", re.IGNORECASE)
+_13F_NT_FORM_RE = re.compile(r"^13F-NT(?:/A)?$", re.IGNORECASE)
 # 13D/G form matching (both "SC 13D" and bare "13D" forms)
 _13DG_FORM_RE = re.compile(r"^(?:SC\s+)?13[DG](?:/A)?$", re.IGNORECASE)
 # XBRL-bearing annual/quarterly forms
 _XBRL_ANNUAL_QUARTERLY_RE = re.compile(
     r"^(?:10-[KQ]|20-F|40-F|6-K)(?:/A)?$", re.IGNORECASE,
 )
-# Fund/ETF forms
+# Fund/ETF forms — all fund form families for discovery
 FUND_FORMS = frozenset({
     "N-PORT", "N-PORT/A", "N-PORT-EX", "N-PORT-EX/A",
     "N-CEN", "N-CEN/A",
     "497", "497K", "497J", "497AD",
     "485APOS", "485BPOS", "485BXT",
 })
+# Broad fund regex kept for reference / discovery gating
 _FUND_FORM_RE = re.compile(
     r"^(?:N-PORT(?:-EX)?|N-CEN|497(?:K|J|AD)?|485[AB]POS|485BXT)(?:/A)?$",
+    re.IGNORECASE,
+)
+# N-PORT-only regex — used by FundHandler.supports() because only N-PORT
+# filings contain structured holdings data that can be meaningfully parsed.
+# N-CEN, 497*, and 485* are text/HTML forms with no structured content;
+# they are still discovered and streamed but not routed to a form handler.
+_NPORT_FORM_RE = re.compile(
+    r"^N-PORT(?:-EX)?(?:/A)?$",
     re.IGNORECASE,
 )
 
@@ -579,7 +591,7 @@ class ThirteenFHolding:
 
 @dataclass(slots=True)
 class ThirteenFFiling:
-    """Parsed 13F-HR filing."""
+    """Parsed 13F-HR filing with holdings data."""
     accession_number: str
     filer_cik: str | None = None
     filer_name: str | None = None
@@ -588,6 +600,25 @@ class ThirteenFFiling:
     total_value_thousands: float | None = None
     entry_count: int = 0
     holdings: list[ThirteenFHolding] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ThirteenFNoticeFiling:
+    """Parsed 13F-NT notice filing.
+
+    A 13F-NT is a *notice* that the filer will file a full 13F-HR later.
+    It contains no information table or holdings data — only the filer
+    identity, report period, and the notice itself.  This model captures
+    that semantic distinction so notice filings are not silently dropped
+    by the holdings-only path.
+    """
+    accession_number: str
+    filer_cik: str | None = None
+    filer_name: str | None = None
+    report_period: str | None = None
+    filing_type: str | None = None          # "13F-NT" or "13F-NT/A"
+    filing_date: str | None = None
+    is_amendment: bool = False
 
 
 # --- 13D/G types ---

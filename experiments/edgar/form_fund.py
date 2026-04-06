@@ -19,7 +19,7 @@ from domain import (
     FundFiling,
     FundHolding,
     SubmissionHeader,
-    _FUND_FORM_RE,
+    _NPORT_FORM_RE,
     get_logger,
 )
 
@@ -138,10 +138,18 @@ def _parse_fund_text(
 
 
 class FundHandler:
-    """FormHandler implementation for fund/ETF filings (N-PORT, N-CEN, 497, 485)."""
+    """FormHandler implementation for N-PORT fund filings.
+
+    Only N-PORT filings contain structured holdings data (CUSIP/ISIN,
+    balance, value, asset category) that can be meaningfully parsed.
+    Other fund form families (N-CEN, 497*, 485*) are text/HTML documents
+    without structured content and are not routed through this handler.
+    They are still discovered and streamed by the ingestor but not
+    structurally parsed.
+    """
 
     def supports(self, form_type: str) -> bool:
-        return bool(_FUND_FORM_RE.fullmatch(form_type.upper().strip()))
+        return bool(_NPORT_FORM_RE.fullmatch(form_type.upper().strip()))
 
     def parse(
         self,
@@ -154,38 +162,30 @@ class FundHandler:
         if primary_bytes is None:
             return None
         try:
-            form_upper = (header.form_type or "").upper().strip()
-            filing: FundFiling | None = None
-
             # N-PORT filings are XML-structured — do NOT fall back to
-            # the generic text parser on failure, because that would
+            # a generic text parser on failure, because that would
             # silently produce a metadata-only FundFiling that is
             # indistinguishable from a successful parse with zero
             # holdings, contaminating downstream datasets.
-            if form_upper.startswith("N-PORT"):
-                filing = _parse_nport_xml(primary_bytes, accession_number)
-                if filing is None:
-                    logger.warning(
-                        "N-PORT XML parse returned None for %s; "
-                        "returning parse failure (no text fallback)",
-                        accession_number,
-                    )
-                    return None
-            else:
-                # Non-N-PORT fund forms (497, 485, N-CEN) use text parse
-                text = primary_bytes.decode("utf-8", errors="replace")
-                filing = _parse_fund_text(text, accession_number, header, discovery)
+            filing = _parse_nport_xml(primary_bytes, accession_number)
+            if filing is None:
+                logger.warning(
+                    "N-PORT XML parse returned None for %s; "
+                    "returning parse failure (no text fallback)",
+                    accession_number,
+                )
+                return None
 
-            if filing is not None:
-                filing.form_type = form_upper
-                canonical = header.canonical_issuer()
-                if canonical:
-                    filing.filer_cik = canonical.cik
-                    filing.filer_name = canonical.name
+            form_upper = (header.form_type or "").upper().strip()
+            filing.form_type = form_upper
+            canonical = header.canonical_issuer()
+            if canonical:
+                filing.filer_cik = canonical.cik
+                filing.filer_name = canonical.name
 
             return filing
         except Exception:
-            logger.exception("Fund form parse failed for %s (non-fatal)", accession_number)
+            logger.exception("N-PORT parse failed for %s (non-fatal)", accession_number)
             return None
 
     def persist(

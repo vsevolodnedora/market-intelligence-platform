@@ -16,6 +16,8 @@ from domain import (
     SubmissionHeader,
     _OWNERSHIP_FORM_RE,
     _13F_FORM_RE,
+    _13F_HR_FORM_RE,
+    _XBRL_ANNUAL_QUARTERLY_RE,
     accession_nodashes,
     derive_archive_base,
     derive_complete_txt_url,
@@ -193,6 +195,142 @@ class FilingRetriever:
 
         return None
 
+    # XBRL instance document resolution helpers
+
+    @staticmethod
+    def _primary_has_xbrl(primary_bytes: bytes | None) -> bool:
+        """Return True if the primary document already contains XBRL data.
+
+        Inline XBRL (iXBRL) embeds facts directly in HTML using ``<ix:``
+        tags or ``<xbrli:`` context elements.  A standalone XBRL instance
+        uses ``<xbrli:xbrl`` as root.
+        """
+        if primary_bytes is None:
+            return False
+        # Check first ~50 KB for XBRL markers to avoid scanning huge files
+        head = primary_bytes[:51200].lower()
+        return b"<ix:" in head or b"<xbrli:" in head
+
+    @staticmethod
+    def _find_xbrl_instance(
+        header: SubmissionHeader,
+        txt_bytes: bytes,
+        primary_filename: str | None,
+    ) -> bytes | None:
+        """Search the SGML container for an XBRL instance document.
+
+        For annual/quarterly filings (10-K, 10-Q, 20-F, 40-F), the
+        primary document may be a cover HTML page while the actual XBRL
+        instance is a separate XML exhibit.  This method looks through
+        the header's document list for XBRL instance candidates and
+        extracts the best match from the SGML container.
+        """
+        _XBRL_DOC_TYPES = ("XBRL INSTANCE", "EX-101.INS")
+        _XBRL_FILENAME_HINTS = (".xml",)
+        _XBRL_CONTENT_MARKERS = (b"<xbrli:xbrl", b"<xbrl", b"<ix:header")
+
+        candidates: list[SubmissionHeader] = []
+        for doc in header.documents:
+            doc_type = (doc.doc_type or "").upper().strip()
+            filename = (doc.filename or "").lower()
+            desc = (doc.description or "").lower()
+
+            # Skip the primary document — we already checked it
+            if doc.filename and primary_filename and doc.filename.lower() == primary_filename.lower():
+                continue
+
+            # Match by doc_type, description, or filename pattern
+            is_xbrl = (
+                any(t in doc_type for t in _XBRL_DOC_TYPES)
+                or "xbrl instance" in desc
+                or (filename.endswith(".xml") and ("xbrl" in desc or "instance" in desc))
+            )
+
+            if is_xbrl and doc.filename:
+                extracted = extract_primary_document_bytes(txt_bytes, doc.filename)
+                if extracted is not None:
+                    # Verify it actually contains XBRL
+                    head = extracted[:10240].lower()
+                    if any(marker in head for marker in _XBRL_CONTENT_MARKERS):
+                        return extracted
+
+        # Broader fallback: scan XML documents in the container for XBRL
+        # content markers (handles filings where doc_type is just the
+        # form type rather than "XBRL INSTANCE")
+        for doc in header.documents:
+            filename = (doc.filename or "").lower()
+            if doc.filename and primary_filename and doc.filename.lower() == primary_filename.lower():
+                continue
+            if not filename.endswith(".xml"):
+                continue
+            doc_type = (doc.doc_type or "").upper().strip()
+            # Skip schemas, linkbases, and stylesheets
+            if any(s in doc_type for s in ("SCHEMA", "LINKBASE", "XSD", "XSLT")):
+                continue
+            if any(s in filename for s in ("_lab.", "_def.", "_pre.", "_cal.", "_ref.")):
+                continue
+            extracted = extract_primary_document_bytes(txt_bytes, doc.filename)
+            if extracted is not None:
+                head = extracted[:10240].lower()
+                if any(marker in head for marker in _XBRL_CONTENT_MARKERS):
+                    return extracted
+
+        return None
+
+    async def _fetch_xbrl_instance_from_index(
+        self,
+        cik: str,
+        acc: str,
+    ) -> bytes | None:
+        """Fetch an XBRL instance document via index page lookup.
+
+        Falls back to HTTP fetch when the XBRL instance is not in the
+        SGML container (which happens when the filing uses a separate
+        XML instance document not embedded in the .txt).
+        """
+        _XBRL_DOC_TYPES = ("XBRL INSTANCE", "EX-101.INS")
+        _XBRL_CONTENT_MARKERS = (b"<xbrli:xbrl", b"<xbrl", b"<ix:header")
+
+        index_url = derive_index_url(cik, acc)
+        try:
+            index_bytes, _ = await self.client.get_bytes(index_url)
+            index_html = index_bytes.decode("utf-8", errors="replace")
+            doc_rows = parse_index_document_rows(index_html)
+
+            for row in doc_rows:
+                doc_type = (row.doc_type or "").upper().strip()
+                filename = (row.filename or "").lower()
+                desc = (row.description or "").lower()
+
+                is_xbrl = (
+                    any(t in doc_type for t in _XBRL_DOC_TYPES)
+                    or "xbrl instance" in desc
+                    or (filename.endswith(".xml") and ("xbrl" in desc or "instance" in desc))
+                )
+
+                if is_xbrl and (row.href or row.filename):
+                    from urllib.parse import urljoin
+                    import html as _html
+                    if row.href:
+                        fetch_url = urljoin(index_url, _html.unescape(row.href))
+                    else:
+                        fetch_url = f"{derive_archive_base(cik, acc)}/{row.filename}"
+                    try:
+                        data, _ = await self.client.get_bytes(fetch_url)
+                        # Verify it actually contains XBRL
+                        head = data[:10240].lower()
+                        if any(marker in head for marker in _XBRL_CONTENT_MARKERS):
+                            return data
+                    except Exception:
+                        logger.warning(
+                            "failed to fetch XBRL instance from %s", fetch_url,
+                        )
+
+        except Exception:
+            logger.warning("XBRL index lookup failed for %s", acc)
+
+        return None
+
     async def retrieve_full(self, discovery: FilingDiscovery) -> bool:
         """Full retrieval: text-first, extract primary doc, parse structured forms.
 
@@ -327,14 +465,17 @@ class FilingRetriever:
                         except Exception:
                             logger.exception("fallback HTTP fetch failed for %s", acc)
 
-            # For 13F filings, the primary document is often
+            # For 13F-HR filings, the primary document is often
             # the cover HTML, not the information-table XML.  Detect and
             # fetch the information table explicitly so the handler
             # receives the correct document.
+            # NOTE: 13F-NT (notice) filings have no information table —
+            # they are handled by ThirteenFNoticeHandler which only needs
+            # the primary document for metadata extraction.
             form_upper = (header.form_type or "").upper().strip()
             infotable_bytes: bytes | None = None
 
-            if _13F_FORM_RE.fullmatch(form_upper):
+            if _13F_HR_FORM_RE.fullmatch(form_upper):
                 infotable_bytes = self._find_13f_infotable(
                     header, txt_bytes, target_filename,
                 )
@@ -355,6 +496,34 @@ class FilingRetriever:
                         acc,
                     )
 
+            # For XBRL-bearing forms (10-K, 10-Q, 20-F, 40-F, 6-K),
+            # the primary document may be a cover HTML page while the
+            # actual XBRL instance is a separate XML exhibit.  Detect
+            # and fetch the XBRL instance explicitly so XBRLHandler
+            # receives the correct document.
+            xbrl_instance_bytes: bytes | None = None
+
+            if _XBRL_ANNUAL_QUARTERLY_RE.fullmatch(form_upper):
+                if not self._primary_has_xbrl(extracted_bytes):
+                    xbrl_instance_bytes = self._find_xbrl_instance(
+                        header, txt_bytes, target_filename,
+                    )
+                    if xbrl_instance_bytes is None:
+                        xbrl_instance_bytes = await self._fetch_xbrl_instance_from_index(
+                            cik, acc,
+                        )
+                    if xbrl_instance_bytes is not None:
+                        logger.info(
+                            "XBRL instance resolved for %s (%d bytes)",
+                            acc, len(xbrl_instance_bytes),
+                        )
+                    else:
+                        logger.debug(
+                            "XBRL instance not found separately for %s — "
+                            "handler will receive primary document",
+                            acc,
+                        )
+
             # 4. Structured extraction via form handler registry
             #    Use get_handler() for first-match semantics per the
             #    FormRegistry contract.
@@ -363,11 +532,15 @@ class FilingRetriever:
             handler = self.form_registry.get_handler(form_upper)
             if handler is not None:
                 handler_name = type(handler).__name__
-                # For 13F, pass the information table bytes instead of
+                # For 13F-HR, pass the information table bytes instead of
                 # the primary document when available
                 handler_bytes = extracted_bytes
                 if infotable_bytes is not None and handler_name == "ThirteenFHandler":
                     handler_bytes = infotable_bytes
+                # For XBRL forms, pass the XBRL instance bytes when the
+                # primary document did not contain XBRL data
+                if xbrl_instance_bytes is not None and handler_name == "XBRLHandler":
+                    handler_bytes = xbrl_instance_bytes
                 parsed = handler.parse(
                     accession_number=acc,
                     header=header,

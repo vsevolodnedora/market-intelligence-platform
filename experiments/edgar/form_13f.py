@@ -16,6 +16,9 @@ from domain import (
     SubmissionHeader,
     ThirteenFFiling,
     ThirteenFHolding,
+    ThirteenFNoticeFiling,
+    _13F_HR_FORM_RE,
+    _13F_NT_FORM_RE,
     _13F_FORM_RE,
     get_logger,
 )
@@ -159,10 +162,14 @@ def parse_13f_xml(xml_bytes: bytes, accession_number: str) -> ThirteenFFiling | 
 
 
 class ThirteenFHandler:
-    """FormHandler implementation for 13F-HR and 13F-HR/A filings."""
+    """FormHandler implementation for 13F-HR and 13F-HR/A filings.
+
+    Only matches holdings-report filings.  Notice filings (13F-NT) are
+    handled by ``ThirteenFNoticeHandler``.
+    """
 
     def supports(self, form_type: str) -> bool:
-        return bool(_13F_FORM_RE.fullmatch(form_type.upper().strip()))
+        return bool(_13F_HR_FORM_RE.fullmatch(form_type.upper().strip()))
 
     def parse(
         self,
@@ -243,3 +250,97 @@ class ThirteenFHandler:
         if not parsed.holdings:
             return []
         return [build_13f_event(accession_number, parsed)]
+
+
+# ---------------------------------------------------------------------------
+# 13F-NT notice handler
+# ---------------------------------------------------------------------------
+
+class ThirteenFNoticeHandler:
+    """FormHandler implementation for 13F-NT and 13F-NT/A notice filings.
+
+    A 13F-NT is a notice of intent to file a full 13F-HR.  It contains
+    no information table — only filer identity and report period metadata.
+    This handler captures that metadata in a dedicated table and emits a
+    distinct event so downstream consumers can distinguish notices from
+    actual holdings reports.
+    """
+
+    def supports(self, form_type: str) -> bool:
+        return bool(_13F_NT_FORM_RE.fullmatch(form_type.upper().strip()))
+
+    def parse(
+        self,
+        *,
+        accession_number: str,
+        header: SubmissionHeader,
+        primary_bytes: bytes | None,
+        discovery: FilingDiscovery,
+    ) -> ThirteenFNoticeFiling | None:
+        try:
+            form_type = (header.form_type or "").strip()
+            is_amendment = "/A" in form_type.upper()
+            filing = ThirteenFNoticeFiling(
+                accession_number=accession_number,
+                filing_type=form_type,
+                is_amendment=is_amendment,
+            )
+
+            canonical = header.canonical_issuer()
+            if canonical:
+                filing.filer_cik = canonical.cik
+                filing.filer_name = canonical.name
+
+            # Report period from header
+            if header.period_of_report:
+                raw = header.period_of_report.strip().replace("-", "")
+                if len(raw) == 8 and raw.isdigit():
+                    filing.report_period = f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
+                else:
+                    filing.report_period = header.period_of_report.strip()
+
+            if discovery.filing_date:
+                filing.filing_date = discovery.filing_date.isoformat()
+
+            return filing
+        except Exception:
+            logger.exception(
+                "13F-NT parse failed for %s (non-fatal)", accession_number,
+            )
+            return None
+
+    def persist(
+        self,
+        conn: sqlite3.Connection,
+        accession_number: str,
+        parsed: Any,
+        now_iso: str,
+    ) -> None:
+        if not isinstance(parsed, ThirteenFNoticeFiling):
+            return
+        f = parsed
+        conn.execute(
+            "DELETE FROM thirteenf_notices WHERE accession_number=?",
+            (accession_number,),
+        )
+        conn.execute(
+            """INSERT INTO thirteenf_notices (
+                accession_number, filing_type, filer_cik, filer_name,
+                report_period, filing_date, is_amendment, created_at
+            ) VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                accession_number, f.filing_type, f.filer_cik, f.filer_name,
+                f.report_period, f.filing_date, int(f.is_amendment), now_iso,
+            ),
+        )
+
+    def build_events(
+        self,
+        accession_number: str,
+        parsed: Any,
+        **kwargs: Any,
+    ) -> list[Any]:
+        from event_builders import build_13f_notice_event
+        if not isinstance(parsed, ThirteenFNoticeFiling):
+            return []
+        return [build_13f_notice_event(accession_number, parsed)]

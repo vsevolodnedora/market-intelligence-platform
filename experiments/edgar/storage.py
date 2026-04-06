@@ -250,6 +250,19 @@ class SQLiteStorage:
                     FOREIGN KEY(accession_number) REFERENCES filings(accession_number)
                 );
 
+                CREATE TABLE IF NOT EXISTS thirteenf_notices (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    accession_number TEXT NOT NULL UNIQUE,
+                    filing_type TEXT,
+                    filer_cik TEXT,
+                    filer_name TEXT,
+                    report_period TEXT,
+                    filing_date TEXT,
+                    is_amendment INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(accession_number) REFERENCES filings(accession_number)
+                );
+
                 CREATE TABLE IF NOT EXISTS thirteendg_filings (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     accession_number TEXT NOT NULL UNIQUE,
@@ -355,6 +368,10 @@ class SQLiteStorage:
                     ON thirteenf_holdings(filer_cik, report_period);
                 CREATE INDEX IF NOT EXISTS idx_13f_acc
                     ON thirteenf_holdings(accession_number);
+                CREATE INDEX IF NOT EXISTS idx_13f_nt_filer
+                    ON thirteenf_notices(filer_cik, report_period);
+                CREATE INDEX IF NOT EXISTS idx_13f_nt_acc
+                    ON thirteenf_notices(accession_number);
                 CREATE INDEX IF NOT EXISTS idx_13dg_subject
                     ON thirteendg_filings(subject_cik, filing_date);
                 CREATE INDEX IF NOT EXISTS idx_13dg_filer
@@ -475,6 +492,26 @@ class SQLiteStorage:
                     ON thirteenf_holdings(filer_cik, report_period);
                 CREATE INDEX IF NOT EXISTS idx_13f_acc
                     ON thirteenf_holdings(accession_number);
+            """)
+
+        if "thirteenf_notices" not in existing_tables:
+            new_tables_ddl.append("""
+                CREATE TABLE IF NOT EXISTS thirteenf_notices (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    accession_number TEXT NOT NULL UNIQUE,
+                    filing_type TEXT,
+                    filer_cik TEXT,
+                    filer_name TEXT,
+                    report_period TEXT,
+                    filing_date TEXT,
+                    is_amendment INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(accession_number) REFERENCES filings(accession_number)
+                );
+                CREATE INDEX IF NOT EXISTS idx_13f_nt_filer
+                    ON thirteenf_notices(filer_cik, report_period);
+                CREATE INDEX IF NOT EXISTS idx_13f_nt_acc
+                    ON thirteenf_notices(accession_number);
             """)
 
         if "thirteendg_filings" not in existing_tables:
