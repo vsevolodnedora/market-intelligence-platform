@@ -212,6 +212,123 @@ class SQLiteStorage:
                     FOREIGN KEY(accession_number) REFERENCES filings(accession_number)
                 );
 
+                CREATE TABLE IF NOT EXISTS eight_k_exhibit_facts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    accession_number TEXT NOT NULL,
+                    item_number TEXT NOT NULL,
+                    fact_type TEXT NOT NULL,
+                    fact_key TEXT NOT NULL,
+                    fact_value TEXT,
+                    fact_numeric REAL,
+                    currency TEXT,
+                    period TEXT,
+                    filing_date TEXT,
+                    company_name TEXT,
+                    cik TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(accession_number) REFERENCES filings(accession_number)
+                );
+
+                CREATE TABLE IF NOT EXISTS thirteenf_holdings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    accession_number TEXT NOT NULL,
+                    filer_cik TEXT,
+                    filer_name TEXT,
+                    report_period TEXT,
+                    issuer_name TEXT,
+                    title_of_class TEXT,
+                    cusip TEXT,
+                    value_thousands REAL,
+                    shares_or_principal REAL,
+                    shares_or_principal_type TEXT,
+                    investment_discretion TEXT,
+                    voting_sole INTEGER,
+                    voting_shared INTEGER,
+                    voting_none INTEGER,
+                    put_call TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(accession_number) REFERENCES filings(accession_number)
+                );
+
+                CREATE TABLE IF NOT EXISTS thirteendg_filings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    accession_number TEXT NOT NULL UNIQUE,
+                    form_type TEXT,
+                    filer_cik TEXT,
+                    filer_name TEXT,
+                    subject_cik TEXT,
+                    subject_name TEXT,
+                    subject_cusip TEXT,
+                    date_of_event TEXT,
+                    ownership_percent REAL,
+                    shares_beneficially_owned REAL,
+                    is_amendment INTEGER DEFAULT 0,
+                    amendment_number INTEGER,
+                    filing_date TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(accession_number) REFERENCES filings(accession_number)
+                );
+
+                CREATE TABLE IF NOT EXISTS xbrl_facts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    accession_number TEXT NOT NULL,
+                    filer_cik TEXT,
+                    form_type TEXT,
+                    period_of_report TEXT,
+                    concept TEXT NOT NULL,
+                    value TEXT,
+                    numeric_value REAL,
+                    unit TEXT,
+                    decimals TEXT,
+                    context_id TEXT,
+                    period_start TEXT,
+                    period_end TEXT,
+                    period_instant TEXT,
+                    segment TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(accession_number) REFERENCES filings(accession_number)
+                );
+
+                CREATE TABLE IF NOT EXISTS fund_filings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    accession_number TEXT NOT NULL UNIQUE,
+                    form_type TEXT,
+                    filer_cik TEXT,
+                    filer_name TEXT,
+                    series_id TEXT,
+                    series_name TEXT,
+                    class_id TEXT,
+                    report_date TEXT,
+                    total_assets REAL,
+                    net_assets REAL,
+                    holding_count INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(accession_number) REFERENCES filings(accession_number)
+                );
+
+                CREATE TABLE IF NOT EXISTS fund_holdings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    accession_number TEXT NOT NULL,
+                    issuer_name TEXT,
+                    title TEXT,
+                    cusip TEXT,
+                    isin TEXT,
+                    lei TEXT,
+                    balance REAL,
+                    units TEXT,
+                    value_usd REAL,
+                    pct_of_nav REAL,
+                    asset_category TEXT,
+                    issuer_category TEXT,
+                    country TEXT,
+                    currency TEXT,
+                    is_restricted INTEGER DEFAULT 0,
+                    maturity_date TEXT,
+                    coupon_rate REAL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(accession_number) REFERENCES filings(accession_number)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_filings_relevance
                     ON filings(relevance_state, retrieval_status);
                 CREATE INDEX IF NOT EXISTS idx_filings_archive_cik
@@ -224,10 +341,38 @@ class SQLiteStorage:
                     ON form4_transactions(reporting_owner_cik, transaction_date);
                 CREATE INDEX IF NOT EXISTS idx_8k_item
                     ON eight_k_events(item_number, filing_date);
+                CREATE INDEX IF NOT EXISTS idx_8k_exhibit_facts_acc
+                    ON eight_k_exhibit_facts(accession_number);
+                CREATE INDEX IF NOT EXISTS idx_8k_exhibit_facts_type
+                    ON eight_k_exhibit_facts(fact_type, filing_date);
                 CREATE INDEX IF NOT EXISTS idx_form4_holdings_issuer
                     ON form4_holdings(issuer_ticker);
                 CREATE INDEX IF NOT EXISTS idx_form4_holdings_owner
                     ON form4_holdings(reporting_owner_cik);
+                CREATE INDEX IF NOT EXISTS idx_13f_cusip
+                    ON thirteenf_holdings(cusip, report_period);
+                CREATE INDEX IF NOT EXISTS idx_13f_filer
+                    ON thirteenf_holdings(filer_cik, report_period);
+                CREATE INDEX IF NOT EXISTS idx_13f_acc
+                    ON thirteenf_holdings(accession_number);
+                CREATE INDEX IF NOT EXISTS idx_13dg_subject
+                    ON thirteendg_filings(subject_cik, filing_date);
+                CREATE INDEX IF NOT EXISTS idx_13dg_filer
+                    ON thirteendg_filings(filer_cik, filing_date);
+                CREATE INDEX IF NOT EXISTS idx_xbrl_concept
+                    ON xbrl_facts(concept, filer_cik);
+                CREATE INDEX IF NOT EXISTS idx_xbrl_acc
+                    ON xbrl_facts(accession_number);
+                CREATE INDEX IF NOT EXISTS idx_xbrl_filer
+                    ON xbrl_facts(filer_cik, form_type, period_of_report);
+                CREATE INDEX IF NOT EXISTS idx_fund_filings_filer
+                    ON fund_filings(filer_cik, form_type);
+                CREATE INDEX IF NOT EXISTS idx_fund_holdings_cusip
+                    ON fund_holdings(cusip);
+                CREATE INDEX IF NOT EXISTS idx_fund_holdings_isin
+                    ON fund_holdings(isin);
+                CREATE INDEX IF NOT EXISTS idx_fund_holdings_acc
+                    ON fund_holdings(accession_number);
 
                 -- Retry/replay indexes: these predicates are hit repeatedly
                 -- by the daemon's retry, transient-fail, stranded-work, and
@@ -266,6 +411,188 @@ class SQLiteStorage:
                 "ALTER TABLE form4_transactions ADD COLUMN is_derivative INTEGER DEFAULT 0"
             )
             logger.info("migration: added is_derivative column to form4_transactions")
+            conn.commit()
+
+        # Migration 2: Create new tables for expanded form support.
+        # Using CREATE TABLE IF NOT EXISTS so this is idempotent.
+        existing_tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+
+        new_tables_ddl = []
+        if "eight_k_exhibit_facts" not in existing_tables:
+            new_tables_ddl.append("""
+                CREATE TABLE IF NOT EXISTS eight_k_exhibit_facts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    accession_number TEXT NOT NULL,
+                    item_number TEXT NOT NULL,
+                    fact_type TEXT NOT NULL,
+                    fact_key TEXT NOT NULL,
+                    fact_value TEXT,
+                    fact_numeric REAL,
+                    currency TEXT,
+                    period TEXT,
+                    filing_date TEXT,
+                    company_name TEXT,
+                    cik TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(accession_number) REFERENCES filings(accession_number)
+                );
+                CREATE INDEX IF NOT EXISTS idx_8k_exhibit_facts_acc
+                    ON eight_k_exhibit_facts(accession_number);
+                CREATE INDEX IF NOT EXISTS idx_8k_exhibit_facts_type
+                    ON eight_k_exhibit_facts(fact_type, filing_date);
+            """)
+
+        if "thirteenf_holdings" not in existing_tables:
+            new_tables_ddl.append("""
+                CREATE TABLE IF NOT EXISTS thirteenf_holdings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    accession_number TEXT NOT NULL,
+                    filer_cik TEXT,
+                    filer_name TEXT,
+                    report_period TEXT,
+                    issuer_name TEXT,
+                    title_of_class TEXT,
+                    cusip TEXT,
+                    value_thousands REAL,
+                    shares_or_principal REAL,
+                    shares_or_principal_type TEXT,
+                    investment_discretion TEXT,
+                    voting_sole INTEGER,
+                    voting_shared INTEGER,
+                    voting_none INTEGER,
+                    put_call TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(accession_number) REFERENCES filings(accession_number)
+                );
+                CREATE INDEX IF NOT EXISTS idx_13f_cusip
+                    ON thirteenf_holdings(cusip, report_period);
+                CREATE INDEX IF NOT EXISTS idx_13f_filer
+                    ON thirteenf_holdings(filer_cik, report_period);
+                CREATE INDEX IF NOT EXISTS idx_13f_acc
+                    ON thirteenf_holdings(accession_number);
+            """)
+
+        if "thirteendg_filings" not in existing_tables:
+            new_tables_ddl.append("""
+                CREATE TABLE IF NOT EXISTS thirteendg_filings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    accession_number TEXT NOT NULL UNIQUE,
+                    form_type TEXT,
+                    filer_cik TEXT,
+                    filer_name TEXT,
+                    subject_cik TEXT,
+                    subject_name TEXT,
+                    subject_cusip TEXT,
+                    date_of_event TEXT,
+                    ownership_percent REAL,
+                    shares_beneficially_owned REAL,
+                    is_amendment INTEGER DEFAULT 0,
+                    amendment_number INTEGER,
+                    filing_date TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(accession_number) REFERENCES filings(accession_number)
+                );
+                CREATE INDEX IF NOT EXISTS idx_13dg_subject
+                    ON thirteendg_filings(subject_cik, filing_date);
+                CREATE INDEX IF NOT EXISTS idx_13dg_filer
+                    ON thirteendg_filings(filer_cik, filing_date);
+            """)
+
+        if "xbrl_facts" not in existing_tables:
+            new_tables_ddl.append("""
+                CREATE TABLE IF NOT EXISTS xbrl_facts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    accession_number TEXT NOT NULL,
+                    filer_cik TEXT,
+                    form_type TEXT,
+                    period_of_report TEXT,
+                    concept TEXT NOT NULL,
+                    value TEXT,
+                    numeric_value REAL,
+                    unit TEXT,
+                    decimals TEXT,
+                    context_id TEXT,
+                    period_start TEXT,
+                    period_end TEXT,
+                    period_instant TEXT,
+                    segment TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(accession_number) REFERENCES filings(accession_number)
+                );
+                CREATE INDEX IF NOT EXISTS idx_xbrl_concept
+                    ON xbrl_facts(concept, filer_cik);
+                CREATE INDEX IF NOT EXISTS idx_xbrl_acc
+                    ON xbrl_facts(accession_number);
+                CREATE INDEX IF NOT EXISTS idx_xbrl_filer
+                    ON xbrl_facts(filer_cik, form_type, period_of_report);
+            """)
+
+        if "fund_filings" not in existing_tables:
+            new_tables_ddl.append("""
+                CREATE TABLE IF NOT EXISTS fund_filings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    accession_number TEXT NOT NULL UNIQUE,
+                    form_type TEXT,
+                    filer_cik TEXT,
+                    filer_name TEXT,
+                    series_id TEXT,
+                    series_name TEXT,
+                    class_id TEXT,
+                    report_date TEXT,
+                    total_assets REAL,
+                    net_assets REAL,
+                    holding_count INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(accession_number) REFERENCES filings(accession_number)
+                );
+                CREATE INDEX IF NOT EXISTS idx_fund_filings_filer
+                    ON fund_filings(filer_cik, form_type);
+            """)
+
+        if "fund_holdings" not in existing_tables:
+            new_tables_ddl.append("""
+                CREATE TABLE IF NOT EXISTS fund_holdings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    accession_number TEXT NOT NULL,
+                    issuer_name TEXT,
+                    title TEXT,
+                    cusip TEXT,
+                    isin TEXT,
+                    lei TEXT,
+                    balance REAL,
+                    units TEXT,
+                    value_usd REAL,
+                    pct_of_nav REAL,
+                    asset_category TEXT,
+                    issuer_category TEXT,
+                    country TEXT,
+                    currency TEXT,
+                    is_restricted INTEGER DEFAULT 0,
+                    maturity_date TEXT,
+                    coupon_rate REAL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(accession_number) REFERENCES filings(accession_number)
+                );
+                CREATE INDEX IF NOT EXISTS idx_fund_holdings_cusip
+                    ON fund_holdings(cusip);
+                CREATE INDEX IF NOT EXISTS idx_fund_holdings_isin
+                    ON fund_holdings(isin);
+                CREATE INDEX IF NOT EXISTS idx_fund_holdings_acc
+                    ON fund_holdings(accession_number);
+            """)
+
+        if new_tables_ddl:
+            for ddl in new_tables_ddl:
+                conn.executescript(ddl)
+            logger.info(
+                "migration: created %d new tables for expanded form support",
+                len(new_tables_ddl),
+            )
             conn.commit()
 
     def upsert_discovery(self, d: FilingDiscovery) -> bool:

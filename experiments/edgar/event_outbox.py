@@ -77,7 +77,13 @@ class EventSubjects:
     FILING_FAILED = "edgar.filing.failed"
     FORM4_PARSED = "edgar.form4.parsed"
     EIGHT_K_ITEM = "edgar.8k.item_detected"
+    EIGHT_K_FACTS = "edgar.8k.facts_extracted"
     FEED_GAP = "edgar.feed.gap_detected"
+    # New form-specific subjects
+    THIRTEEN_F_PARSED = "edgar.13f.parsed"
+    THIRTEEN_DG_PARSED = "edgar.13dg.parsed"
+    XBRL_PARSED = "edgar.xbrl.parsed"
+    FUND_FILING_PARSED = "edgar.fund.parsed"
 
 
 # ---------------------------------------------------------------------------
@@ -810,7 +816,14 @@ class FilingCommitService:
             artifact = bundle.artifact
             # Extract legacy form results for backward compat
             form4 = bundle.form_results.get("Form4Handler")
-            eight_k_events = bundle.form_results.get("EightKHandler")
+            _eight_k_raw = bundle.form_results.get("EightKHandler")
+            # EightKHandler now returns a dict; unpack for legacy path
+            if isinstance(_eight_k_raw, dict):
+                eight_k_events = _eight_k_raw.get("events")
+            elif isinstance(_eight_k_raw, list):
+                eight_k_events = _eight_k_raw
+            else:
+                eight_k_events = None
 
         # Must have required fields by now
         assert accession_number is not None

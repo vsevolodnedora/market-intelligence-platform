@@ -105,6 +105,10 @@ from event_outbox import (
 from form_registry import FormRegistry
 from form_form4 import Form4Handler
 from form_eight_k import EightKHandler
+from form_13f import ThirteenFHandler
+from form_13dg import ThirteenDGHandler
+from form_xbrl import XBRLHandler
+from form_fund import FundHandler
 from retrieval import FilingRetriever
 
 from metrics import METRICS
@@ -300,6 +304,10 @@ class IngestionDaemon:
         self.form_registry = FormRegistry()
         self.form_registry.register(Form4Handler())
         self.form_registry.register(EightKHandler())
+        self.form_registry.register(ThirteenFHandler())
+        self.form_registry.register(ThirteenDGHandler())
+        self.form_registry.register(XBRLHandler())
+        self.form_registry.register(FundHandler())
         self.retriever = FilingRetriever(
             client, storage, settings.raw_dir,
             retry_base_seconds=settings.retry_base_seconds,

@@ -423,7 +423,7 @@ def archive_filing(
 # ---------------------------------------------------------------------------
 
 def _atomic_copy(src: Path, dst: Path) -> str:
-    """Copy *src* to *dst* using temp-file → fsync → rename (Issue #7).
+    """Copy *src* to *dst* using temp-file → fsync → rename
 
     Uses streaming reads to avoid holding the entire file in memory.
     Returns the sha256 hex digest of the copied bytes.

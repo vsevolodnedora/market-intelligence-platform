@@ -116,11 +116,38 @@ OWNERSHIP_FORMS = frozenset({"3", "4", "5", "3/A", "4/A", "5/A"})
 _OWNERSHIP_FORM_RE = re.compile(r"^(?:3|4|5)(?:/A)?$", re.IGNORECASE)
 ACTIVIST_FORMS = frozenset({"SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A", "13D", "13G"})
 
+# 13F form matching
+_13F_FORM_RE = re.compile(r"^13F-(?:HR|NT)(?:/A)?$", re.IGNORECASE)
+# 13D/G form matching (both "SC 13D" and bare "13D" forms)
+_13DG_FORM_RE = re.compile(r"^(?:SC\s+)?13[DG](?:/A)?$", re.IGNORECASE)
+# XBRL-bearing annual/quarterly forms
+_XBRL_ANNUAL_QUARTERLY_RE = re.compile(
+    r"^(?:10-[KQ]|20-F|40-F|6-K)(?:/A)?$", re.IGNORECASE,
+)
+# Fund/ETF forms
+FUND_FORMS = frozenset({
+    "N-PORT", "N-PORT/A", "N-PORT-EX", "N-PORT-EX/A",
+    "N-CEN", "N-CEN/A",
+    "497", "497K", "497J", "497AD",
+    "485APOS", "485BPOS", "485BXT",
+})
+_FUND_FORM_RE = re.compile(
+    r"^(?:N-PORT(?:-EX)?|N-CEN|497(?:K|J|AD)?|485[AB]POS|485BXT)(?:/A)?$",
+    re.IGNORECASE,
+)
+
 # --- Form taxonomy (expanded per migration plan) ---
 
 DEFAULT_DIRECT_FORMS: tuple[str, ...] = (
     "8-K", "8-K/A", "10-K", "10-K/A", "10-Q", "10-Q/A",
     "6-K", "6-K/A", "20-F", "20-F/A", "40-F", "40-F/A",
+    # Institutional holdings
+    "13F-HR", "13F-HR/A", "13F-NT", "13F-NT/A",
+    # Fund/ETF filings
+    "N-PORT", "N-PORT/A", "N-PORT-EX", "N-PORT-EX/A",
+    "N-CEN", "N-CEN/A",
+    "497", "497K", "497J", "497AD",
+    "485APOS", "485BPOS", "485BXT",
 )
 DEFAULT_AMBIGUOUS_FORMS: tuple[str, ...] = (
     "3", "3/A", "4", "4/A", "5", "5/A",
@@ -507,6 +534,146 @@ class EightKEvent:
     filing_date: str | None = None
     company_name: str | None = None
     cik: str | None = None
+
+
+@dataclass(slots=True)
+class EightKExhibitFact:
+    """Structured fact extracted from an 8-K exhibit or body text.
+
+    Goes beyond item-number detection to capture quantitative and
+    qualitative data from 2.02 earnings, deal economics, guidance, etc.
+    """
+    accession_number: str
+    item_number: str
+    fact_type: str  # e.g. "earnings_eps", "revenue", "guidance", "deal_value", "management_change"
+    fact_key: str   # e.g. "eps_diluted", "revenue_q3", "new_ceo_name"
+    fact_value: str | None = None
+    fact_numeric: float | None = None
+    currency: str | None = None
+    period: str | None = None  # e.g. "Q3 2025", "FY2025"
+    filing_date: str | None = None
+    company_name: str | None = None
+    cik: str | None = None
+
+
+# --- 13F types ---
+
+@dataclass(slots=True)
+class ThirteenFHolding:
+    """Single holding row from a 13F-HR information table."""
+    issuer_name: str | None = None
+    title_of_class: str | None = None
+    cusip: str | None = None
+    value_thousands: float | None = None
+    shares_or_principal: float | None = None
+    shares_or_principal_type: str | None = None  # "SH" or "PRN"
+    investment_discretion: str | None = None     # "SOLE", "SHARED", "DFND"
+    voting_sole: int | None = None
+    voting_shared: int | None = None
+    voting_none: int | None = None
+    put_call: str | None = None  # "PUT", "CALL", or None
+
+
+@dataclass(slots=True)
+class ThirteenFFiling:
+    """Parsed 13F-HR filing."""
+    accession_number: str
+    filer_cik: str | None = None
+    filer_name: str | None = None
+    report_period: str | None = None       # e.g. "2025-03-31"
+    filing_type: str | None = None          # "13F-HR" or "13F-HR/A"
+    total_value_thousands: float | None = None
+    entry_count: int = 0
+    holdings: list[ThirteenFHolding] = field(default_factory=list)
+
+
+# --- 13D/G types ---
+
+@dataclass(slots=True)
+class ThirteenDGFiling:
+    """Parsed SC 13D or SC 13G filing."""
+    accession_number: str
+    form_type: str | None = None       # "SC 13D", "SC 13G", etc.
+    filer_cik: str | None = None
+    filer_name: str | None = None
+    subject_cik: str | None = None
+    subject_name: str | None = None
+    subject_cusip: str | None = None
+    date_of_event: str | None = None
+    ownership_percent: float | None = None
+    shares_beneficially_owned: float | None = None
+    is_amendment: bool = False
+    amendment_number: int | None = None
+    filing_date: str | None = None
+
+
+# --- XBRL types ---
+
+@dataclass(slots=True)
+class XBRLFact:
+    """Single XBRL fact extracted from an inline-XBRL or instance document."""
+    concept: str               # e.g. "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax"
+    value: str | None = None
+    numeric_value: float | None = None
+    unit: str | None = None    # e.g. "USD", "shares"
+    period_start: str | None = None
+    period_end: str | None = None
+    period_instant: str | None = None
+    decimals: str | None = None
+    context_id: str | None = None
+    segment: str | None = None  # dimension member if any
+
+
+@dataclass(slots=True)
+class XBRLFiling:
+    """Parsed XBRL data from a 10-K/10-Q/20-F/40-F filing."""
+    accession_number: str
+    form_type: str | None = None
+    filer_cik: str | None = None
+    filer_name: str | None = None
+    period_of_report: str | None = None
+    fiscal_year_end: str | None = None
+    facts: list[XBRLFact] = field(default_factory=list)
+
+
+# --- Fund/ETF types ---
+
+@dataclass(slots=True)
+class FundHolding:
+    """Single holding from an N-PORT filing."""
+    issuer_name: str | None = None
+    title: str | None = None
+    cusip: str | None = None
+    isin: str | None = None
+    lei: str | None = None
+    balance: float | None = None
+    units: str | None = None       # "NS" (shares), "PA" (principal), "NC" (contracts)
+    value_usd: float | None = None
+    pct_of_nav: float | None = None
+    asset_category: str | None = None
+    issuer_category: str | None = None
+    country: str | None = None
+    currency: str | None = None
+    is_restricted: bool = False
+    maturity_date: str | None = None
+    coupon_rate: float | None = None
+
+
+@dataclass(slots=True)
+class FundFiling:
+    """Parsed fund filing (N-PORT, N-CEN, 497, 485)."""
+    accession_number: str
+    form_type: str | None = None
+    filer_cik: str | None = None
+    filer_name: str | None = None
+    series_id: str | None = None
+    series_name: str | None = None
+    class_id: str | None = None
+    report_date: str | None = None
+    total_assets: float | None = None
+    net_assets: float | None = None
+    holding_count: int = 0
+    holdings: list[FundHolding] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

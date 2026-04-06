@@ -25,9 +25,11 @@ from domain import (  # noqa: F401
     DOC_TEXT_BODY_RE,
     DOCUMENT_RE,
     EightKEvent,
+    EightKExhibitFact,
     FALLBACK_CIK_RE,
     FALLBACK_NAME_RE,
     FIELD_PATTERNS,
+    FUND_FORMS,
     FeedWatermark,
     FilingArtifact,
     FilingDiscovery,
@@ -37,6 +39,8 @@ from domain import (  # noqa: F401
     Form4Filing,
     Form4Holding,
     Form4Transaction,
+    FundFiling,
+    FundHolding,
     HREF_CIK_RE,
     ITEM_INFO_RE,
     IndexDocumentRow,
@@ -53,7 +57,14 @@ from domain import (  # noqa: F401
     SubmissionHeader,
     TEXTUAL_PRIMARY_EXTENSIONS,
     TITLE_RE,
+    ThirteenDGFiling,
+    ThirteenFFiling,
+    ThirteenFHolding,
     WatchlistCompany,
+    XBRLFact,
+    XBRLFiling,
+    _13DG_FORM_RE,
+    _13F_FORM_RE,
     _ANGLE_SECTION_RE,
     _COLON_SECTION_RE,
     _DEFAULT_MAX_RETRIES,
@@ -61,6 +72,7 @@ from domain import (  # noqa: F401
     _DOC_END_RE_B,
     _DOC_START_RE_B,
     _FILENAME_RE_B,
+    _FUND_FORM_RE,
     _INDEX_TABLE_ROW_RE,
     _OWNERSHIP_FORM_RE,
     _RETRYABLE_HTTP_CODES,
@@ -69,6 +81,7 @@ from domain import (  # noqa: F401
     _TERMINAL_RETRIEVAL_STATUSES,
     _TEXT_END_RE_B,
     _TEXT_START_RE_B,
+    _XBRL_ANNUAL_QUARTERLY_RE,
     _XML_WRAPPER_END_B,
     _XML_WRAPPER_START_B,
     _validate_accession,
@@ -138,3 +151,7 @@ from storage import SQLiteStorage  # noqa: F401
 from form_registry import FormHandler, FormRegistry  # noqa: F401
 from form_form4 import Form4Handler, parse_form4_xml  # noqa: F401
 from form_eight_k import EightKHandler, parse_8k_items  # noqa: F401
+from form_13f import ThirteenFHandler, parse_13f_xml  # noqa: F401
+from form_13dg import ThirteenDGHandler, parse_13dg_text  # noqa: F401
+from form_xbrl import XBRLHandler, parse_xbrl_filing  # noqa: F401
+from form_fund import FundHandler  # noqa: F401

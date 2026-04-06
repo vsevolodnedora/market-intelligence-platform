@@ -12,7 +12,12 @@ from typing import Any
 from event_outbox import EventEnvelope, EventSubjects
 from domain import (
     EightKEvent,
+    EightKExhibitFact,
     Form4Filing,
+    ThirteenFFiling,
+    ThirteenDGFiling,
+    XBRLFiling,
+    FundFiling,
 )
 
 
@@ -156,4 +161,181 @@ def build_feed_gap_event(
             "watermark_ts": watermark_ts,
             "pages_checked": pages_checked,
         },
+    )
+
+
+def build_8k_facts_event(
+    accession_number: str,
+    facts: list[EightKExhibitFact],
+) -> EventEnvelope:
+    """Build an event for deep-extracted 8-K exhibit/body facts."""
+    fact_summaries = []
+    for f in facts[:30]:  # Cap payload size
+        fact_summaries.append({
+            "item_number": f.item_number,
+            "fact_type": f.fact_type,
+            "fact_key": f.fact_key,
+            "fact_value": f.fact_value,
+            "fact_numeric": f.fact_numeric,
+            "currency": f.currency,
+        })
+    return EventEnvelope.new(
+        subject=EventSubjects.EIGHT_K_FACTS,
+        accession_number=accession_number,
+        payload={
+            "fact_count": len(facts),
+            "facts": fact_summaries,
+            "company_name": facts[0].company_name if facts else None,
+            "cik": facts[0].cik if facts else None,
+            "filing_date": facts[0].filing_date if facts else None,
+        },
+        business_key=accession_number,
+    )
+
+
+def build_13f_event(
+    accession_number: str,
+    filing: ThirteenFFiling,
+) -> EventEnvelope:
+    """Build an event for a parsed 13F-HR institutional holdings filing."""
+    # Top holdings by value for the event payload
+    top_holdings = sorted(
+        filing.holdings,
+        key=lambda h: h.value_thousands or 0,
+        reverse=True,
+    )[:20]
+    return EventEnvelope.new(
+        subject=EventSubjects.THIRTEEN_F_PARSED,
+        accession_number=accession_number,
+        payload={
+            "filer_cik": filing.filer_cik,
+            "filer_name": filing.filer_name,
+            "report_period": filing.report_period,
+            "total_value_thousands": filing.total_value_thousands,
+            "entry_count": filing.entry_count,
+            "top_holdings": [
+                {
+                    "issuer_name": h.issuer_name,
+                    "cusip": h.cusip,
+                    "value_thousands": h.value_thousands,
+                    "shares": h.shares_or_principal,
+                }
+                for h in top_holdings
+            ],
+        },
+        business_key=accession_number,
+    )
+
+
+def build_13dg_event(
+    accession_number: str,
+    filing: ThirteenDGFiling,
+) -> EventEnvelope:
+    """Build an event for a parsed SC 13D/G activist filing."""
+    return EventEnvelope.new(
+        subject=EventSubjects.THIRTEEN_DG_PARSED,
+        accession_number=accession_number,
+        payload={
+            "form_type": filing.form_type,
+            "filer_cik": filing.filer_cik,
+            "filer_name": filing.filer_name,
+            "subject_cik": filing.subject_cik,
+            "subject_name": filing.subject_name,
+            "subject_cusip": filing.subject_cusip,
+            "ownership_percent": filing.ownership_percent,
+            "shares_beneficially_owned": filing.shares_beneficially_owned,
+            "is_amendment": filing.is_amendment,
+            "amendment_number": filing.amendment_number,
+            "date_of_event": filing.date_of_event,
+            "filing_date": filing.filing_date,
+        },
+        business_key=accession_number,
+    )
+
+
+def build_xbrl_event(
+    accession_number: str,
+    filing: XBRLFiling,
+) -> EventEnvelope:
+    """Build an event for parsed XBRL facts from annual/quarterly filings.
+
+    The payload includes only key financial concepts to keep event size
+    bounded.  Full fact data is available in the xbrl_facts table.
+    """
+    # Key concepts for the event payload
+    _KEY_PREFIXES = (
+        "us-gaap:Revenue", "us-gaap:NetIncomeLoss",
+        "us-gaap:EarningsPerShare", "us-gaap:Assets",
+        "us-gaap:Liabilities", "us-gaap:StockholdersEquity",
+        "us-gaap:OperatingIncomeLoss", "us-gaap:GrossProfit",
+        "us-gaap:CashAndCashEquivalents",
+        "us-gaap:NetCashProvided",
+        "ifrs-full:Revenue", "ifrs-full:ProfitLoss",
+        "ifrs-full:Assets", "ifrs-full:Equity",
+    )
+    key_facts = []
+    for fact in filing.facts:
+        if any(fact.concept.startswith(p) for p in _KEY_PREFIXES):
+            key_facts.append({
+                "concept": fact.concept,
+                "value": fact.value,
+                "numeric_value": fact.numeric_value,
+                "unit": fact.unit,
+                "context_id": fact.context_id,
+            })
+        if len(key_facts) >= 50:
+            break
+
+    return EventEnvelope.new(
+        subject=EventSubjects.XBRL_PARSED,
+        accession_number=accession_number,
+        payload={
+            "form_type": filing.form_type,
+            "filer_cik": filing.filer_cik,
+            "filer_name": filing.filer_name,
+            "period_of_report": filing.period_of_report,
+            "total_fact_count": len(filing.facts),
+            "key_facts": key_facts,
+        },
+        business_key=accession_number,
+    )
+
+
+def build_fund_event(
+    accession_number: str,
+    filing: FundFiling,
+) -> EventEnvelope:
+    """Build an event for a parsed fund/ETF filing."""
+    # Top holdings by value for N-PORT
+    top_holdings = sorted(
+        filing.holdings,
+        key=lambda h: h.value_usd or 0,
+        reverse=True,
+    )[:20]
+    return EventEnvelope.new(
+        subject=EventSubjects.FUND_FILING_PARSED,
+        accession_number=accession_number,
+        payload={
+            "form_type": filing.form_type,
+            "filer_cik": filing.filer_cik,
+            "filer_name": filing.filer_name,
+            "series_id": filing.series_id,
+            "series_name": filing.series_name,
+            "report_date": filing.report_date,
+            "total_assets": filing.total_assets,
+            "net_assets": filing.net_assets,
+            "holding_count": filing.holding_count,
+            "top_holdings": [
+                {
+                    "issuer_name": h.issuer_name,
+                    "cusip": h.cusip,
+                    "isin": h.isin,
+                    "value_usd": h.value_usd,
+                    "pct_of_nav": h.pct_of_nav,
+                    "asset_category": h.asset_category,
+                }
+                for h in top_holdings
+            ],
+        },
+        business_key=accession_number,
     )
