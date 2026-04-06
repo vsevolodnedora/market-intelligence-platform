@@ -127,7 +127,7 @@ class AsyncStorageProxy:
 
     Every method delegates to the underlying synchronous storage via
     ``asyncio.to_thread()``, ensuring that no SQLite call blocks the
-    event loop.  This addresses extension_plan Issue #1.
+    event loop.
 
     The synchronous ``storage`` object is still available as ``.sync``
     for the few paths that already run inside ``asyncio.to_thread()``
@@ -285,7 +285,7 @@ class IngestionDaemon:
     ) -> None:
         self.settings = settings
         # Wrap storage in async proxy so ALL SQLite calls from daemon methods
-        # are offloaded to a thread pool (extension_plan Issue #1).
+        # are offloaded to a thread pool.
         # The raw synchronous storage is passed to outbox / commit_service /
         # retriever which already handle their own threading.
         self.storage = AsyncStorageProxy(storage)
@@ -745,7 +745,6 @@ class IngestionDaemon:
         if success:
             # Track end-to-end latency from enqueue to event commit — only
             # on success so SLA dashboards aren't blurred by failure events
-            # (extension_plan2 §9).
             pipeline_latency = _time.monotonic() - item.created_at
             METRICS.record_discovery_to_event_latency(pipeline_latency)
         else:
@@ -814,7 +813,6 @@ class IngestionDaemon:
                                 if not ok:
                                     # Stale lease: another process or expired lease
                                     # claimed this event.  Do NOT count as published.
-                                    # (Extension plan §4E.)
                                     stale_count += 1
                                     logger.warning(
                                         "outbox: stale lease for event %s — "

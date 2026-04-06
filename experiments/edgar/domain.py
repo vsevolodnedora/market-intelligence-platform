@@ -136,7 +136,7 @@ _FUND_FORM_RE = re.compile(
     re.IGNORECASE,
 )
 
-# --- Form taxonomy (expanded per migration plan) ---
+# --- Form taxonomy ---
 
 DEFAULT_DIRECT_FORMS: tuple[str, ...] = (
     "8-K", "8-K/A", "10-K", "10-K/A", "10-Q", "10-Q/A",

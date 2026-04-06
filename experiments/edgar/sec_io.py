@@ -217,6 +217,16 @@ class PooledTransport:
                 resp = conn.getresponse()
                 body = resp.read()
                 resp_headers = {k.lower(): v for k, v in resp.getheaders()}
+                # Decompress here on the worker thread so large gzipped
+                # SEC payloads don't stall the event loop.
+                encoding = resp_headers.get("content-encoding", "").lower()
+                if encoding == "gzip":
+                    body = gzip.decompress(body)
+                elif encoding == "deflate":
+                    try:
+                        body = zlib.decompress(body)
+                    except zlib.error:
+                        body = zlib.decompress(body, -zlib.MAX_WBITS)
                 return resp.status, body, resp_headers
             except (
                 ConnectionError, OSError, self._http_client.HTTPException,
@@ -228,21 +238,25 @@ class PooledTransport:
 
         raise IOError(f"Failed to connect to {host}:{port}")
 
+    def close(self) -> None:
+        """Explicitly close all pooled connections."""
+        pool = getattr(self._local, "pool", None)
+        if pool:
+            for key, (conn, _) in list(pool.items()):
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            pool.clear()
+
     async def request(
         self, method: str, url: str, headers: dict[str, str],
     ) -> tuple[int, bytes, dict[str, str]]:
-        status, body, resp_headers = await asyncio.to_thread(
+        # Decompression is handled inside _do_request_sync on the worker
+        # thread so the event loop is never stalled by CPU-bound gzip work.
+        return await asyncio.to_thread(
             self._do_request_sync, method, url, headers,
         )
-        encoding = resp_headers.get("content-encoding", "").lower()
-        if encoding == "gzip":
-            body = gzip.decompress(body)
-        elif encoding == "deflate":
-            try:
-                body = zlib.decompress(body)
-            except zlib.error:
-                body = zlib.decompress(body, -zlib.MAX_WBITS)
-        return status, body, resp_headers
 
 
 class UrllibTransport:
@@ -333,7 +347,15 @@ class SECClient:
         self._retry_base = settings.retry_base_seconds
 
     async def aclose(self) -> None:
-        pass
+        """Close the underlying transport's connection pool.
+
+        For PooledTransport, this explicitly closes all pooled TCP/TLS
+        connections.  Without this, connections leak until GC.
+        """
+        transport = self._transport
+        if hasattr(transport, "close"):
+            # PooledTransport.close() is synchronous but fast
+            await asyncio.get_running_loop().run_in_executor(None, transport.close)
 
     async def __aenter__(self) -> SECClient:
         return self

@@ -98,7 +98,7 @@ def _copy_and_verify(
     """Copy *src* to *dst* byte-identically and verify the hash.
 
     Uses streaming reads and a single pass to avoid holding entire files
-    in memory twice (extension_plan2 §8).
+    in memory twice.
 
     Returns (success, sha256_hex_of_copy).  If *expected_sha256* is
     provided and does not match, returns (False, actual_hash).
@@ -231,7 +231,6 @@ def archive_filing(
 ) -> bool:
     """Archive a single filing's artifacts.
 
-    Follows the required workflow from extension_plan.md:
       1. Select eligible retrieved filing (already done by caller)
       2. Copy raw artifact files to archive storage
       3. Verify archived bytes against content hashes
@@ -255,7 +254,7 @@ def archive_filing(
     # Defense-in-depth: reject filings whose artifact paths already live
     # under the archive root.  Without this guard, _derive_archive_path()
     # would produce dst == src, and the subsequent delete step would
-    # destroy the only remaining copy.  (Extension plan §3A.)
+    # destroy the only remaining copy.
     archive_prefix = str(archive_dir.resolve()).rstrip("/") + "/"
     for candidate_path in (raw_txt_path, primary_doc_path):
         if candidate_path and str(Path(candidate_path).resolve()).startswith(archive_prefix):
@@ -475,7 +474,7 @@ def archive_jsonl_events(
 ) -> None:
     """Archive prior-day UTC event JSONL files.
 
-    Per extension_plan.md: archive only prior-day files.  The publisher
+    Archive only prior-day files.  The publisher
     writes to the current UTC-day file, so touching today's file would
     race with live append/fsync behavior.
 
@@ -496,7 +495,7 @@ def archive_jsonl_events(
         if dst.exists():
             # Already archived — verify integrity before deleting original.
             # Without this check, a corrupt archive copy would cause the
-            # only good data to be destroyed (extension plan §3C).
+            # only good data to be destroyed.
             if not dry_run:
                 src_hash = _streaming_sha256(f)
                 dst_hash = _streaming_sha256(dst)

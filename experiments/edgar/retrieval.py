@@ -1,9 +1,4 @@
-"""Filing retrieval pipeline — text-first approach with form dispatch.
-
-Moved out of ``edgar_daemon.py`` so the daemon remains orchestration-first.
-``retrieve_full()`` is the main extension point for adding new form families
-via the ``FormRegistry``.
-"""
+"""Filing retrieval pipeline — text-first approach with form dispatch."""
 
 from __future__ import annotations
 
@@ -20,6 +15,7 @@ from domain import (
     RetrievedFilingBundle,
     SubmissionHeader,
     _OWNERSHIP_FORM_RE,
+    _13F_FORM_RE,
     accession_nodashes,
     derive_archive_base,
     derive_complete_txt_url,
@@ -40,6 +36,7 @@ from sec_io import (
     choose_primary_document_from_header,
     extract_primary_document_bytes,
     normalized_header_metadata,
+    parse_index_document_rows,
     parse_submission_text,
 )
 from storage import SQLiteStorage
@@ -101,6 +98,101 @@ class FilingRetriever:
         text = await self.client.get_text(txt_url)
         return parse_submission_text(text)
 
+    # 13F information table resolution helpers
+
+    @staticmethod
+    def _find_13f_infotable(
+        header: SubmissionHeader,
+        txt_bytes: bytes,
+        primary_filename: str | None,
+    ) -> bytes | None:
+        """Search the SGML container for the 13F information table XML.
+
+        For 13F filings, the primary document selector often picks the
+        cover HTML (doc_type "13F-HR") instead of the separate
+        INFORMATION TABLE XML exhibit.  This method looks through the
+        header's document list for the infotable and extracts it from
+        the SGML container.
+        """
+        _INFOTABLE_PATTERNS = (
+            "information table", "infotable", "info_table",
+        )
+
+        for doc in header.documents:
+            doc_type = (doc.doc_type or "").upper().strip()
+            filename = (doc.filename or "").lower()
+            desc = (doc.description or "").lower()
+
+            # Skip the primary document — we already have that
+            if doc.filename and primary_filename and doc.filename.lower() == primary_filename.lower():
+                continue
+
+            # Match by doc_type or description or filename
+            is_infotable = (
+                "INFORMATION TABLE" in doc_type
+                or any(p in desc for p in _INFOTABLE_PATTERNS)
+                or any(p in filename for p in _INFOTABLE_PATTERNS)
+            )
+
+            if is_infotable and doc.filename:
+                extracted = extract_primary_document_bytes(txt_bytes, doc.filename)
+                if extracted is not None:
+                    return extracted
+
+        return None
+
+    async def _fetch_13f_infotable_from_index(
+        self,
+        cik: str,
+        acc: str,
+        form_type: str | None,
+    ) -> bytes | None:
+        """Fetch the 13F information table via index page lookup.
+
+        Falls back to HTTP fetch when the infotable is not in the SGML
+        container (which happens for many real-world 13F filings).
+        """
+        _INFOTABLE_PATTERNS = (
+            "information table", "infotable", "info_table",
+        )
+
+        index_url = derive_index_url(cik, acc)
+        try:
+            index_bytes, _ = await self.client.get_bytes(index_url)
+            index_html = index_bytes.decode("utf-8", errors="replace")
+            doc_rows = parse_index_document_rows(index_html)
+
+            for row in doc_rows:
+                doc_type = (row.doc_type or "").upper().strip()
+                filename = (row.filename or "").lower()
+                desc = (row.description or "").lower()
+
+                is_infotable = (
+                    "INFORMATION TABLE" in doc_type
+                    or any(p in desc for p in _INFOTABLE_PATTERNS)
+                    or any(p in filename for p in _INFOTABLE_PATTERNS)
+                )
+
+                if is_infotable and (row.href or row.filename):
+                    from urllib.parse import urljoin
+                    import html as _html
+                    if row.href:
+                        fetch_url = urljoin(index_url, _html.unescape(row.href))
+                    else:
+                        fetch_url = f"{derive_archive_base(cik, acc)}/{row.filename}"
+                    try:
+                        data, _ = await self.client.get_bytes(fetch_url)
+                        return data
+                    except Exception:
+                        logger.warning(
+                            "failed to fetch 13F infotable from %s", fetch_url,
+                        )
+
+        except Exception:
+            logger.warning("13F index lookup failed for %s", acc)
+
+        return None
+
     async def retrieve_full(self, discovery: FilingDiscovery) -> bool:
         """Full retrieval: text-first, extract primary doc, parse structured forms.
 
@@ -149,8 +241,31 @@ class FilingRetriever:
             extracted_bytes: bytes | None = None
             artifact: FilingArtifact | None = None
 
+            # When header parsing produces no documents and
+            # discovery.primary_document_url is absent, target_filename is
+            # None.  Go directly to index lookup before accepting a partial
+            # retrieval.
+            if target_filename is None:
+                logger.info(
+                    "no primary document from header for %s — consulting filing index",
+                    acc,
+                )
+                index_url = derive_index_url(cik, acc)
+                try:
+                    index_bytes, _ = await self.client.get_bytes(index_url)
+                    alt = choose_primary_document(
+                        index_bytes.decode("utf-8", errors="replace"),
+                        index_url, form_type=header.form_type,
+                    )
+                    if alt:
+                        target_filename = alt.rsplit("/", 1)[-1] if "/" in alt else alt
+                        primary_url = alt if alt.startswith("http") else f"{derive_archive_base(cik, acc)}/{target_filename}"
+                except Exception:
+                    logger.warning("index lookup for missing primary doc failed for %s", acc)
+
             if target_filename:
-                primary_url = f"{derive_archive_base(cik, acc)}/{target_filename}"
+                if primary_url is None:
+                    primary_url = f"{derive_archive_base(cik, acc)}/{target_filename}"
                 extracted_bytes = extract_primary_document_bytes(txt_bytes, target_filename)
                 if extracted_bytes is not None:
                     pdoc_name = safe_filename(target_filename)
@@ -201,21 +316,55 @@ class FilingRetriever:
                         except Exception:
                             logger.exception("fallback HTTP fetch failed for %s", acc)
 
-            # 4. Structured extraction via form handler registry
+            # For 13F filings, the primary document is often
+            # the cover HTML, not the information-table XML.  Detect and
+            # fetch the information table explicitly so the handler
+            # receives the correct document.
             form_upper = (header.form_type or "").upper().strip()
+            infotable_bytes: bytes | None = None
+
+            if _13F_FORM_RE.fullmatch(form_upper):
+                infotable_bytes = self._find_13f_infotable(
+                    header, txt_bytes, target_filename,
+                )
+                if infotable_bytes is None:
+                    # Try index-based lookup for the infotable document
+                    infotable_bytes = await self._fetch_13f_infotable_from_index(
+                        cik, acc, header.form_type,
+                    )
+                if infotable_bytes is not None:
+                    logger.info(
+                        "13F info table resolved for %s (%d bytes)",
+                        acc, len(infotable_bytes),
+                    )
+                else:
+                    logger.warning(
+                        "13F info table not found for %s — handler will receive "
+                        "primary document (may be cover HTML)",
+                        acc,
+                    )
+
+            # 4. Structured extraction via form handler registry
+            #    Use get_handler() for first-match semantics per the
+            #    FormRegistry contract.
             form_results: dict[str, Any] = {}
 
-            for handler in self.form_registry.handlers:
-                if handler.supports(form_upper):
-                    handler_name = type(handler).__name__
-                    parsed = handler.parse(
-                        accession_number=acc,
-                        header=header,
-                        primary_bytes=extracted_bytes,
-                        discovery=discovery,
-                    )
-                    if parsed is not None:
-                        form_results[handler_name] = parsed
+            handler = self.form_registry.get_handler(form_upper)
+            if handler is not None:
+                handler_name = type(handler).__name__
+                # For 13F, pass the information table bytes instead of
+                # the primary document when available
+                handler_bytes = extracted_bytes
+                if infotable_bytes is not None and handler_name == "ThirteenFHandler":
+                    handler_bytes = infotable_bytes
+                parsed = handler.parse(
+                    accession_number=acc,
+                    header=header,
+                    primary_bytes=handler_bytes,
+                    discovery=discovery,
+                )
+                if parsed is not None:
+                    form_results[handler_name] = parsed
 
             # 5. Build the bundle
             bundle = RetrievedFilingBundle(

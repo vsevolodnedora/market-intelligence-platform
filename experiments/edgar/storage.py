@@ -704,8 +704,7 @@ class SQLiteStorage:
         ``unresolved``), also resets ``retrieval_status`` back to
         ``discovered`` so that stale ``queued`` status cannot cause the
         filing to be replayed into retrieval by ``list_stranded_work()``
-        or startup replay.  This closes the state-machine bug described
-        in extension_plan2 §3.
+        or startup replay.  This closes the state-machine bug described.
         """
         now = utcnow().isoformat()
         # Terminal header-gate outcomes must clear retrieval_status to
@@ -1056,7 +1055,7 @@ class SQLiteStorage:
 
         Excludes terminal relevance states (irrelevant, direct_unmatched,
         hdr_failed, unresolved) — these should never be retried for
-        retrieval (extension_plan2 §3).
+        retrieval.
         """
         with self._conn() as conn:
             rows = conn.execute(
@@ -1158,7 +1157,7 @@ class SQLiteStorage:
           - ``hdr_transient_fail`` — covered by ``list_hdr_transient_fail``
           - ``irrelevant``, ``direct_unmatched`` — no retrieval needed
           - ``hdr_failed``, ``unresolved`` — terminal header-gate outcomes
-            that must not be replayed into retrieval (extension_plan2 §3)
+            that must not be replayed into retrieval.
         """
         with self._conn() as conn:
             rows = conn.execute(
@@ -1423,8 +1422,7 @@ class SQLiteStorage:
             results = [dict(r) for r in rows]
 
             # Post-filter: skip filings whose artifact paths are already
-            # under the archive root.  This prevents the critical
-            # re-archival data-loss bug (extension_plan §3A).
+            # under the archive root.
             if archive_dir:
                 archive_prefix = str(archive_dir).rstrip("/") + "/"
                 filtered: list[dict[str, Any]] = []

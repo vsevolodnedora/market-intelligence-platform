@@ -14,7 +14,7 @@ downstream consumers.  It owns:
      outbox rows, publishes them (currently to a pluggable callback; NATS
      integration is a future step), and marks them published.
 
-Design rationale (from the extension plan):
+Design rationale:
 
     Filesystem + SQLite + NATS cannot be made truly atomic in one step.
     The correct pattern is:
@@ -112,10 +112,11 @@ class EventEnvelope:
     subject: str
     accession_number: str
     payload: dict[str, Any]
-    created_at: str  # ISO-8601
+    created_at: str  # ISO-8601 — envelope construction time (pre-commit)
     payload_hash: str = ""  # SHA-256 of canonical payload JSON
     lease_token: str | None = None  # Set during lease_pending()
     commit_seq: int | None = None   # DB-assigned monotonic sequence
+    committed_at: str | None = None # ISO-8601 — actual DB commit time
 
     @staticmethod
     def new(
@@ -164,6 +165,7 @@ CREATE TABLE IF NOT EXISTS outbox_events (
     next_attempt_at TEXT,
     last_error TEXT,
     created_at TEXT NOT NULL,
+    committed_at TEXT,
     published_at TEXT,
     leased_at TEXT,
     lease_token TEXT
@@ -233,6 +235,9 @@ class OutboxStore:
             "CREATE INDEX IF NOT EXISTS idx_outbox_commit_seq "
             "ON outbox_events(status, commit_seq)"
         )
+        if "committed_at" not in cols:
+            conn.execute("ALTER TABLE outbox_events ADD COLUMN committed_at TEXT")
+            logger.info("outbox migration: added committed_at column for transaction-time accuracy")
 
     # --- Transactional writes (caller owns the connection & transaction) ---
 
@@ -252,6 +257,11 @@ class OutboxStore:
         payload_json = dump_json(envelope.payload)
         payload_hash = envelope.payload_hash or hashlib.sha256(payload_json.encode()).hexdigest()[:16]
 
+        # Stamp committed_at inside the transaction for accurate commit-time
+        # semantics.  This replaces the pre-commit created_at for partitioning
+        # and ordering purposes.
+        committed_now = utcnow().isoformat()
+
         # Check if this event_id already exists
         existing = conn.execute(
             "SELECT commit_seq, payload_hash, status FROM outbox_events WHERE event_id = ?",
@@ -263,8 +273,8 @@ class OutboxStore:
             conn.execute(
                 """INSERT INTO outbox_events
                    (event_id, accession_number, subject, payload_json, payload_hash,
-                    status, publish_attempts, created_at)
-                   VALUES (?, ?, ?, ?, ?, 'pending', 0, ?)""",
+                    status, publish_attempts, created_at, committed_at)
+                   VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)""",
                 (
                     envelope.event_id,
                     envelope.accession_number,
@@ -272,8 +282,10 @@ class OutboxStore:
                     payload_json,
                     payload_hash,
                     envelope.created_at,
+                    committed_now,
                 ),
             )
+            envelope.committed_at = committed_now
             # For migrated schemas where commit_seq is a plain column (not PK),
             # it will be NULL after the insert above.  Backfill it from the max.
             row = conn.execute(
@@ -296,23 +308,34 @@ class OutboxStore:
             old_hash = existing["payload_hash"] if existing["payload_hash"] else ""
             if old_hash != payload_hash:
                 # Payload changed: update and re-queue for publication.
+                # CRITICAL: assign a new monotonic commit_seq so downstream
+                # consumers can reliably order corrections.  The documented
+                # contract is "highest commit_seq for a given event_id wins";
+                # preserving the old commit_seq would violate that invariant.
+                next_seq = conn.execute(
+                    "SELECT COALESCE(MAX(commit_seq), 0) + 1 FROM outbox_events"
+                ).fetchone()[0]
                 conn.execute(
                     """UPDATE outbox_events
                        SET payload_json = ?, payload_hash = ?,
                            status = 'pending', publish_attempts = 0,
                            published_at = NULL, last_error = NULL,
                            next_attempt_at = NULL, leased_at = NULL,
-                           lease_token = NULL, created_at = ?
+                           lease_token = NULL, created_at = ?,
+                           commit_seq = ?, committed_at = ?
                        WHERE event_id = ?""",
-                    (payload_json, payload_hash, envelope.created_at, envelope.event_id),
+                    (payload_json, payload_hash, envelope.created_at, next_seq, committed_now, envelope.event_id),
                 )
+                envelope.commit_seq = next_seq
+                envelope.committed_at = committed_now
                 logger.info(
                     "correction detected for event_id=%s subject=%s: "
-                    "payload changed (old_hash=%s new_hash=%s), re-queued",
-                    envelope.event_id, envelope.subject, old_hash, payload_hash,
+                    "payload changed (old_hash=%s new_hash=%s), re-queued with commit_seq=%d",
+                    envelope.event_id, envelope.subject, old_hash, payload_hash, next_seq,
                 )
-            # else: identical payload — idempotent no-op
-            envelope.commit_seq = existing["commit_seq"]
+            else:
+                # Identical payload — idempotent no-op
+                envelope.commit_seq = existing["commit_seq"]
 
     def insert_events(self, conn: sqlite3.Connection, envelopes: list[EventEnvelope]) -> None:
         """Insert multiple outbox events — caller must commit."""
@@ -348,7 +371,7 @@ class OutboxStore:
             # where commit_seq may be NULL.
             candidates = conn.execute(
                 """SELECT commit_seq, event_id, accession_number, subject,
-                          payload_json, payload_hash, created_at
+                          payload_json, payload_hash, created_at, committed_at
                    FROM outbox_events
                    WHERE status = 'pending'
                      AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
@@ -376,6 +399,7 @@ class OutboxStore:
                         payload_hash=row["payload_hash"] or "",
                         lease_token=token,
                         commit_seq=row["commit_seq"],
+                        committed_at=row["committed_at"],
                     ))
             conn.commit()
         return results
@@ -419,8 +443,8 @@ class OutboxStore:
         When a ``lease_token`` is provided, the update is guarded by
         ``status = 'leased' AND lease_token = ?`` in a **single** UPDATE
         statement — matching the ``mark_published()`` pattern.  This
-        prevents the stale-lease TOCTOU race described in extension_plan2
-        §5: a stale publisher can no longer pass a SELECT check, lose
+        prevents the stale-lease TOCTOU race.
+        A stale publisher can no longer pass a SELECT check, lose
         ownership, and then overwrite a now-published row.
         """
         now = utcnow()
@@ -619,7 +643,7 @@ def _jsonl_write_sync(
     # When creating a new daily file, fsync the parent directory so the
     # directory entry itself is durable.  Without this, a crash after
     # the file fsync but before directory metadata flush could lose the
-    # file on some filesystems.  (Extension plan §4D.)
+    # file on some filesystems.
     if is_new_file:
         dir_fd = os.open(str(target.parent), os.O_RDONLY)
         try:
@@ -629,14 +653,16 @@ def _jsonl_write_sync(
 
 
 def _event_date_str(envelope: EventEnvelope) -> str:
-    """Extract the date portion of an event's created_at for file partitioning.
+    """Extract the date portion for file partitioning.
 
-    Uses the event's commit timestamp rather than the current wall-clock
-    so that delayed publications land in the correct day-partition.
-    Falls back to UTC now if created_at is unparseable.
+    Prefers ``committed_at`` (actual DB transaction time) over ``created_at``
+    (pre-commit construction time) to avoid day-boundary skew when the
+    system is busy or a transaction crosses midnight UTC.
+    Falls back to ``created_at``, then to UTC now.
     """
+    ts = envelope.committed_at or envelope.created_at
     try:
-        return envelope.created_at[:10]  # "YYYY-MM-DD" prefix of ISO-8601
+        return ts[:10]  # "YYYY-MM-DD" prefix of ISO-8601
     except (TypeError, IndexError):
         return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
@@ -657,9 +683,9 @@ async def jsonl_publish_callback(
     will cause the event to be re-appended on restart.  Consumers MUST
     deduplicate by ``event_id``.
 
-    Day-partitioning is based on the event's ``created_at`` timestamp
-    (commit time), not the current clock, so delayed publications land
-    in the semantically correct partition.
+    Day-partitioning is based on the event's ``committed_at`` timestamp
+    (transaction commit time), not the pre-commit ``created_at``, so
+    delayed publications land in the semantically correct partition.
 
     All blocking I/O (open, write, flush, fsync) is offloaded to a thread
     via ``asyncio.to_thread`` so the event loop is never stalled.
@@ -673,6 +699,7 @@ async def jsonl_publish_callback(
         "payload": envelope.payload,
         "payload_hash": envelope.payload_hash,
         "created_at": envelope.created_at,
+        "committed_at": envelope.committed_at,
         "commit_seq": envelope.commit_seq,
     }, separators=(",", ":"), sort_keys=True)
     await _asyncio.to_thread(_jsonl_write_sync, target, line)
@@ -686,11 +713,11 @@ async def jsonl_publish_batch_callback(
 
     More efficient than per-event fsync under burst load while still
     guaranteeing durability for the entire batch.  Events are grouped
-    by their ``created_at`` date so each lands in the correct partition.
+    by their ``committed_at`` date so each lands in the correct partition.
     """
     if not envelopes:
         return
-    # Group events by their semantic day (created_at, not publish time)
+    # Group events by their semantic day (committed_at, not publish time)
     by_day: dict[str, list[str]] = {}
     for envelope in envelopes:
         day_str = _event_date_str(envelope)
@@ -701,6 +728,7 @@ async def jsonl_publish_batch_callback(
             "payload": envelope.payload,
             "payload_hash": envelope.payload_hash,
             "created_at": envelope.created_at,
+            "committed_at": envelope.committed_at,
             "commit_seq": envelope.commit_seq,
         }, separators=(",", ":"), sort_keys=True)
         by_day.setdefault(day_str, []).append(line)
