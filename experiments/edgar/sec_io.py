@@ -151,6 +151,10 @@ class PooledTransport:
         self._local = threading.local()
         self._http_client = http.client
         self._urlparse = _urlparse
+        # Process-wide registry of every per-thread pool so close() can
+        # reach pools created on executor threads it doesn't run on.
+        self._all_pools: list[dict[str, tuple[Any, int]]] = []
+        self._registry_lock = threading.Lock()
 
     def _thread_pool(self) -> dict[str, tuple[Any, int]]:
         """Return the per-thread connection pool, creating it if needed."""
@@ -158,6 +162,8 @@ class PooledTransport:
         if pool is None:
             pool = {}
             self._local.pool = pool
+            with self._registry_lock:
+                self._all_pools.append(pool)
         return pool
 
     def _get_conn(self, host: str, port: int, scheme: str) -> Any:
@@ -239,15 +245,16 @@ class PooledTransport:
         raise IOError(f"Failed to connect to {host}:{port}")
 
     def close(self) -> None:
-        """Explicitly close all pooled connections."""
-        pool = getattr(self._local, "pool", None)
-        if pool:
-            for key, (conn, _) in list(pool.items()):
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            pool.clear()
+        """Explicitly close all pooled connections across all threads."""
+        with self._registry_lock:
+            for pool in self._all_pools:
+                for key, (conn, _) in list(pool.items()):
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                pool.clear()
+            self._all_pools.clear()
 
     async def request(
         self, method: str, url: str, headers: dict[str, str],
