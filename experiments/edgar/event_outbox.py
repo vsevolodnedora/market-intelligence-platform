@@ -763,36 +763,62 @@ class FilingCommitService:
     def commit_retrieved_filing(
         self,
         *,
-        accession_number: str,
-        archive_cik: str,
-        form_type: str,
-        company_name: str,
-        # Header data
-        header: SubmissionHeader,
+        bundle: "RetrievedFilingBundle | None" = None,
+        form_registry: "FormRegistry | None" = None,
+        # --- Legacy keyword args (backward compatibility) ---
+        accession_number: str | None = None,
+        archive_cik: str | None = None,
+        form_type: str | None = None,
+        company_name: str | None = None,
+        header: SubmissionHeader | None = None,
         canonical_cik: str | None = None,
         canonical_name: str | None = None,
         canonical_name_normalized: str | None = None,
-        # Artifact paths + hashes (already written atomically)
         txt_path: str | None = None,
         txt_sha256: str | None = None,
         primary_doc_path: str | None = None,
         primary_sha256: str | None = None,
         primary_document_url: str | None = None,
-        # Artifact record
         artifact: FilingArtifact | None = None,
-        # Structured extracts
         form4: Form4Filing | None = None,
         eight_k_events: list[EightKEvent] | None = None,
-        # Retry config
         retry_base_seconds: float = 2.0,
-        # Form 4 output caps
-        out_form4_transactions_cap : int = 20,
-        out_form4_owners_cap : int = 10,
+        out_form4_transactions_cap: int = 20,
+        out_form4_owners_cap: int = 10,
     ) -> list[EventEnvelope]:
         """Commit all filing data + outbox events in a single transaction.
 
-        Returns the list of envelopes written (for logging / metrics).
+        Accepts either a ``RetrievedFilingBundle`` (new path) or the legacy
+        keyword arguments for backward compatibility.  Returns the list of
+        envelopes written.
         """
+        from domain import RetrievedFilingBundle
+        from form_registry import FormRegistry
+
+        # --- Normalise inputs: bundle or legacy kwargs ---
+        if bundle is not None:
+            accession_number = bundle.accession_number
+            archive_cik = bundle.archive_cik
+            form_type = bundle.form_type
+            company_name = bundle.company_name
+            header = bundle.header
+            canonical_cik = bundle.canonical_cik
+            canonical_name = bundle.canonical_name
+            canonical_name_normalized = bundle.canonical_name_normalized
+            txt_path = bundle.txt_path
+            txt_sha256 = bundle.txt_sha256
+            primary_doc_path = bundle.primary_doc_path
+            primary_sha256 = bundle.primary_sha256
+            primary_document_url = bundle.primary_document_url
+            artifact = bundle.artifact
+            # Extract legacy form results for backward compat
+            form4 = bundle.form_results.get("Form4Handler")
+            eight_k_events = bundle.form_results.get("EightKHandler")
+
+        # Must have required fields by now
+        assert accession_number is not None
+        assert header is not None
+
         final_status = "retrieved" if primary_doc_path else "retrieved_partial"
         now = utcnow()
         now_iso = now.isoformat()
@@ -801,9 +827,9 @@ class FilingCommitService:
         envelopes: list[EventEnvelope] = []
         envelopes.append(build_filing_retrieved_event(
             accession_number=accession_number,
-            archive_cik=archive_cik,
-            form_type=form_type,
-            company_name=company_name,
+            archive_cik=archive_cik or "",
+            form_type=form_type or "",
+            company_name=company_name or "",
             issuer_cik=canonical_cik,
             issuer_name=canonical_name,
             status=final_status,
@@ -814,10 +840,27 @@ class FilingCommitService:
             filing_date=header.filed_as_of_date,
             header_form_type=header.form_type,
         ))
-        if form4 and (form4.transactions or form4.holdings):
-            envelopes.append(build_form4_event(accession_number, form4, out_form4_transactions_cap, out_form4_owners_cap))
-        if eight_k_events:
-            envelopes.extend(build_8k_events(accession_number, eight_k_events))
+
+        # Build form-specific events via registry if available
+        if bundle is not None and form_registry is not None:
+            form_upper = (header.form_type or "").upper().strip()
+            for handler in form_registry.handlers:
+                handler_name = type(handler).__name__
+                parsed = bundle.form_results.get(handler_name)
+                if parsed is not None:
+                    evts = handler.build_events(
+                        accession_number,
+                        parsed,
+                        out_form4_transactions_cap=out_form4_transactions_cap,
+                        out_form4_owners_cap=out_form4_owners_cap,
+                    )
+                    envelopes.extend(evts)
+        else:
+            # Legacy: hardcoded event building
+            if form4 and (form4.transactions or form4.holdings):
+                envelopes.append(build_form4_event(accession_number, form4, out_form4_transactions_cap, out_form4_owners_cap))
+            if eight_k_events:
+                envelopes.extend(build_8k_events(accession_number, eight_k_events))
 
         # Single transaction for everything
         with self.storage._conn() as conn:
@@ -842,8 +885,6 @@ class FilingCommitService:
             # Filing parties
             if header.parties:
                 for p in header.parties:
-                    # SQLite UNIQUE constraints treat NULLs as distinct, so
-                    # INSERT OR REPLACE won't deduplicate rows where cik is NULL.
                     if p.cik is None:
                         conn.execute(
                             "DELETE FROM filing_parties "
@@ -869,89 +910,88 @@ class FilingCommitService:
                      dump_json(artifact.metadata), now_iso),
                 )
 
-            # Form 4 transactions — always delete existing rows for this
-            # accession so that a reparse with fewer (or zero) rows does not
-            # leave stale data behind.
-            conn.execute(
-                "DELETE FROM form4_transactions WHERE accession_number=?",
-                (accession_number,),
-            )
-            if form4 and form4.transactions:
-                for txn in form4.transactions:
-                    conn.execute(
-                        """INSERT INTO form4_transactions (
-                            accession_number, issuer_cik, issuer_name, issuer_ticker,
-                            reporting_owner_cik, reporting_owner_name,
-                            is_director, is_officer, officer_title, is_ten_pct_owner,
-                            security_title, transaction_date, transaction_code,
-                            shares, price_per_share, acquired_disposed,
-                            shares_owned_after, direct_indirect, is_derivative, created_at
-                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (
-                            accession_number, txn.issuer_cik, txn.issuer_name,
-                            txn.issuer_ticker, txn.reporting_owner_cik,
-                            txn.reporting_owner_name, int(txn.is_director),
-                            int(txn.is_officer), txn.officer_title,
-                            int(txn.is_ten_pct_owner), txn.security_title,
-                            txn.transaction_date, txn.transaction_code,
-                            txn.shares, txn.price_per_share, txn.acquired_disposed,
-                            txn.shares_owned_after, txn.direct_indirect,
-                            int(txn.is_derivative), now_iso,
-                        ),
-                    )
-
-            # Form 4 holdings — unconditional delete
-            conn.execute(
-                "DELETE FROM form4_holdings WHERE accession_number=?",
-                (accession_number,),
-            )
-            if form4 and form4.holdings:
-                for h in form4.holdings:
-                    conn.execute(
-                        """INSERT INTO form4_holdings (
-                            accession_number, issuer_cik, issuer_name, issuer_ticker,
-                            reporting_owner_cik, reporting_owner_name,
-                            is_director, is_officer, officer_title, is_ten_pct_owner,
-                            security_title, shares_owned, direct_indirect,
-                            nature_of_ownership, is_derivative, created_at
-                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (
-                            accession_number, h.issuer_cik, h.issuer_name,
-                            h.issuer_ticker, h.reporting_owner_cik,
-                            h.reporting_owner_name, int(h.is_director),
-                            int(h.is_officer), h.officer_title,
-                            int(h.is_ten_pct_owner), h.security_title,
-                            h.shares_owned, h.direct_indirect,
-                            h.nature_of_ownership, int(h.is_derivative), now_iso,
-                        ),
-                    )
-
-            # 8-K events — unconditional delete before insert
-            conn.execute(
-                "DELETE FROM eight_k_events WHERE accession_number=?",
-                (accession_number,),
-            )
-            if eight_k_events:
-                for ev in eight_k_events:
-                    conn.execute(
-                        """INSERT OR REPLACE INTO eight_k_events (
-                            accession_number, item_number, item_description,
-                            filing_date, company_name, cik, created_at
-                        ) VALUES (?,?,?,?,?,?,?)""",
-                        (ev.accession_number, ev.item_number, ev.item_description,
-                         ev.filing_date, ev.company_name, ev.cik, now_iso),
-                    )
+            # Form-specific persistence via registry
+            if bundle is not None and form_registry is not None:
+                for handler in form_registry.handlers:
+                    handler_name = type(handler).__name__
+                    parsed = bundle.form_results.get(handler_name)
+                    if parsed is not None:
+                        handler.persist(conn, accession_number, parsed, now_iso)
+            else:
+                # Legacy: hardcoded form persistence
+                conn.execute(
+                    "DELETE FROM form4_transactions WHERE accession_number=?",
+                    (accession_number,),
+                )
+                if form4 and form4.transactions:
+                    for txn in form4.transactions:
+                        conn.execute(
+                            """INSERT INTO form4_transactions (
+                                accession_number, issuer_cik, issuer_name, issuer_ticker,
+                                reporting_owner_cik, reporting_owner_name,
+                                is_director, is_officer, officer_title, is_ten_pct_owner,
+                                security_title, transaction_date, transaction_code,
+                                shares, price_per_share, acquired_disposed,
+                                shares_owned_after, direct_indirect, is_derivative, created_at
+                            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (
+                                accession_number, txn.issuer_cik, txn.issuer_name,
+                                txn.issuer_ticker, txn.reporting_owner_cik,
+                                txn.reporting_owner_name, int(txn.is_director),
+                                int(txn.is_officer), txn.officer_title,
+                                int(txn.is_ten_pct_owner), txn.security_title,
+                                txn.transaction_date, txn.transaction_code,
+                                txn.shares, txn.price_per_share, txn.acquired_disposed,
+                                txn.shares_owned_after, txn.direct_indirect,
+                                int(txn.is_derivative), now_iso,
+                            ),
+                        )
+                conn.execute(
+                    "DELETE FROM form4_holdings WHERE accession_number=?",
+                    (accession_number,),
+                )
+                if form4 and form4.holdings:
+                    for h in form4.holdings:
+                        conn.execute(
+                            """INSERT INTO form4_holdings (
+                                accession_number, issuer_cik, issuer_name, issuer_ticker,
+                                reporting_owner_cik, reporting_owner_name,
+                                is_director, is_officer, officer_title, is_ten_pct_owner,
+                                security_title, shares_owned, direct_indirect,
+                                nature_of_ownership, is_derivative, created_at
+                            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (
+                                accession_number, h.issuer_cik, h.issuer_name,
+                                h.issuer_ticker, h.reporting_owner_cik,
+                                h.reporting_owner_name, int(h.is_director),
+                                int(h.is_officer), h.officer_title,
+                                int(h.is_ten_pct_owner), h.security_title,
+                                h.shares_owned, h.direct_indirect,
+                                h.nature_of_ownership, int(h.is_derivative), now_iso,
+                            ),
+                        )
+                conn.execute(
+                    "DELETE FROM eight_k_events WHERE accession_number=?",
+                    (accession_number,),
+                )
+                if eight_k_events:
+                    for ev in eight_k_events:
+                        conn.execute(
+                            """INSERT OR REPLACE INTO eight_k_events (
+                                accession_number, item_number, item_description,
+                                filing_date, company_name, cik, created_at
+                            ) VALUES (?,?,?,?,?,?,?)""",
+                            (ev.accession_number, ev.item_number, ev.item_description,
+                             ev.filing_date, ev.company_name, ev.cik, now_iso),
+                        )
 
             # Retrieval status update
-            # Read current attempt_count
             row = conn.execute(
                 "SELECT attempt_count FROM filings WHERE accession_number=?",
                 (accession_number,),
             ).fetchone()
             current_attempts = (row["attempt_count"] if row else 0) + 1
 
-            # Compute next_retry_at for partial retrievals (matching legacy
-            # update_retrieval_status behaviour); clear it for fully retrieved.
             if final_status == "retrieved_partial":
                 backoff_seconds = min(3600, retry_base_seconds * (2 ** current_attempts))
                 next_retry_iso: str | None = (now + timedelta(seconds=backoff_seconds)).isoformat()
