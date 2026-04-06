@@ -94,6 +94,7 @@ FIELD_PATTERNS: dict[str, re.Pattern[str]] = {
     "acceptance_datetime": re.compile(r"<ACCEPTANCE-DATETIME>(\d{14})", re.IGNORECASE),
     "form_type": re.compile(r"CONFORMED SUBMISSION TYPE:\s*([^\n]+)"),
     "filed_as_of_date": re.compile(r"FILED AS OF DATE:\s*(\d{8})"),
+    "period_of_report": re.compile(r"CONFORMED PERIOD OF REPORT:\s*(\d{8})"),
 }
 
 DOC_FIELD_PATTERNS: dict[str, re.Pattern[str]] = {
@@ -366,6 +367,7 @@ class SubmissionHeader:
     form_type: str | None = None
     acceptance_datetime: str | None = None
     filed_as_of_date: str | None = None
+    period_of_report: str | None = None
     parties: list[FilingParty] = field(default_factory=list)
     documents: list[SubmissionDocument] = field(default_factory=list)
     item_information: list[str] = field(default_factory=list)

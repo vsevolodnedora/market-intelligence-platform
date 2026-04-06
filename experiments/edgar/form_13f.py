@@ -77,26 +77,27 @@ def parse_13f_xml(xml_bytes: bytes, accession_number: str) -> ThirteenFFiling | 
 
     filing = ThirteenFFiling(accession_number=accession_number)
 
-    # Try to find info table entries
-    entries: list[ET.Element] = []
-    for tag_variant in ["infoTable", "informationTable"]:
-        entries = root.findall(f".//{{{_13F_TABLE_NS}}}{tag_variant}")
-        if entries:
+    # Extract report period from XML cover page metadata
+    for period_tag in ["reportCalendarOrQuarter", "periodOfReport"]:
+        period_text = _find_text(root, period_tag)
+        if period_text:
+            cleaned = period_text.strip()
+            # Try ISO YYYY-MM-DD as-is
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", cleaned):
+                filing.report_period = cleaned
+            else:
+                stripped = cleaned.replace("-", "").replace("/", "")
+                if len(stripped) == 8 and stripped.isdigit():
+                    # Distinguish YYYYMMDD from MMDDYYYY:
+                    # if first 4 digits > 1900 assume YYYYMMDD
+                    if int(stripped[:4]) > 1900:
+                        filing.report_period = f"{stripped[:4]}-{stripped[4:6]}-{stripped[6:8]}"
+                    else:
+                        # MMDDYYYY → YYYY-MM-DD
+                        filing.report_period = f"{stripped[4:8]}-{stripped[0:2]}-{stripped[2:4]}"
+                else:
+                    filing.report_period = cleaned
             break
-        entries = root.findall(f".//{{*}}{tag_variant}")
-        if entries:
-            break
-        entries = root.findall(f".//{tag_variant}")
-        if entries:
-            break
-
-    # If no wrapper infoTable found, look directly for individual entries
-    if not entries:
-        for tag_variant in ["infoTable", "informationTable"]:
-            # The root itself might be the table
-            if root.tag.endswith(tag_variant) or root.tag == tag_variant:
-                entries = [root]
-                break
 
     # Find all info table entries (each represents one holding)
     holding_els: list[ET.Element] = []
@@ -110,6 +111,13 @@ def parse_13f_xml(xml_bytes: bytes, accession_number: str) -> ThirteenFFiling | 
         holding_els = root.findall(f".//{tag_variant}")
         if holding_els:
             break
+
+    # If no holding elements found, the root itself might be an infoTable entry
+    if not holding_els:
+        for tag_variant in ["infoTable", "informationTable"]:
+            if root.tag.endswith(tag_variant) or root.tag == tag_variant:
+                holding_els = [root]
+                break
 
     for hel in holding_els:
         holding = ThirteenFHolding(
@@ -175,6 +183,14 @@ class ThirteenFHandler:
                 if canonical:
                     filing.filer_cik = canonical.cik
                     filing.filer_name = canonical.name
+                # Set report_period from SGML header if not already
+                # populated from the XML cover page
+                if not filing.report_period and header.period_of_report:
+                    raw = header.period_of_report.strip().replace("-", "")
+                    if len(raw) == 8 and raw.isdigit():
+                        filing.report_period = f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
+                    else:
+                        filing.report_period = header.period_of_report.strip()
             return filing
         except Exception:
             logger.exception("13F parse failed for %s (non-fatal)", accession_number)
