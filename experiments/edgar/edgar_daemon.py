@@ -985,27 +985,44 @@ class IngestionDaemon:
                 seen.add(d.accession_number)
                 deduped.append(d)
 
-        # If the daemon restarts after the watermark moves but
-        # before the consumer processes the in-memory queue, the filings
-        # are already durably recorded and will be recovered by
-        # _replay_stale_work().
+        # Persist discoveries first so they survive crashes.
         for d in deduped:
             await self.storage.upsert_discovery(d)
 
-        if deduped:
-            await self._advance_watermark(deduped, wm)
-
-        count = 0
+        # Enqueue BEFORE advancing the watermark so that deferred items
+        # (queue full) keep the watermark behind and are rediscovered on
+        # the next Atom poll.
+        enqueued_count = 0
+        all_enqueued = True
         for d in deduped:
-            await self._enqueue(make_work(
+            ok = await self._enqueue(make_work(
                 "discovery", d.accession_number, FilingPriority.LIVE, discovery=d,
             ))
-            count += 1
+            if ok:
+                enqueued_count += 1
+            else:
+                all_enqueued = False
 
-        if count > 0:
-            logger.info("Atom poll: %d new discoveries from %d pages", count, page + 1)
+        # Only advance the watermark when every discovery was successfully
+        # enqueued.  If any were deferred due to queue pressure the
+        # watermark stays put and the next poll will rediscover them,
+        # preventing the silent-drop scenario where work is persisted and
+        # the watermark moves but no in-memory consumer ever processes
+        # the filing.  The _retry_scanner also sweeps unknown+discovered
+        # as defence-in-depth.
+        if deduped and all_enqueued:
+            await self._advance_watermark(deduped, wm)
+        elif deduped and not all_enqueued:
+            logger.warning(
+                "Atom poll: watermark NOT advanced — %d/%d enqueues deferred "
+                "due to queue pressure; next poll will rediscover them",
+                len(deduped) - enqueued_count, len(deduped),
+            )
+
+        if enqueued_count > 0:
+            logger.info("Atom poll: %d new discoveries from %d pages", enqueued_count, page + 1)
         METRICS.touch("edgar_last_atom_poll_success_unixtime")
-        return count
+        return enqueued_count
 
     async def _advance_watermark(self, discoveries: list[FilingDiscovery], prev: FeedWatermark) -> None:
         max_ts = prev.accepted_at
@@ -1110,11 +1127,44 @@ class IngestionDaemon:
                     ))
                     hdr_pending_enqueued += 1
 
-                if enqueued or hdr_enqueued or hdr_pending_enqueued:
+                # unknown+discovered recovery — filings persisted by the
+                # Atom poller (or backfill) whose enqueue was deferred
+                # under queue pressure.  The watermark fix in _poll_atom_once
+                # prevents *new* occurrences, but this sweep is defence-in-
+                # depth for races, crashes, and filings created before the
+                # fix.  Without it, these filings were only recovered on
+                # startup replay and weekly repair.
+                unprocessed = await self.storage.list_unprocessed_discoveries(limit=20)
+                unprocessed_enqueued = 0
+                for record in unprocessed:
+                    async with self._inflight_lock:
+                        if record.accession_number in self._inflight:
+                            continue
+                    d = FilingDiscovery(
+                        accession_number=record.accession_number,
+                        archive_cik=record.archive_cik,
+                        form_type=record.form_type,
+                        company_name=record.company_name,
+                        source="retry_unprocessed_discovery",
+                        complete_txt_url=derive_complete_txt_url(
+                            record.archive_cik, record.accession_number,
+                        ),
+                        hdr_sgml_url=derive_hdr_sgml_url(
+                            record.archive_cik, record.accession_number,
+                        ),
+                    )
+                    await self._enqueue(make_work(
+                        "discovery", d.accession_number,
+                        FilingPriority.RETRY, discovery=d,
+                    ))
+                    unprocessed_enqueued += 1
+
+                if enqueued or hdr_enqueued or hdr_pending_enqueued or unprocessed_enqueued:
                     logger.info(
                         "retry scanner: enqueued %d retrieval + %d hdr_transient "
-                        "+ %d hdr_pending retries",
+                        "+ %d hdr_pending + %d unprocessed retries",
                         enqueued, hdr_enqueued, hdr_pending_enqueued,
+                        unprocessed_enqueued,
                     )
             except Exception:
                 logger.exception("error in retry scanner")
