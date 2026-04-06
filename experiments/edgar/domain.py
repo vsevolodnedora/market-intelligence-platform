@@ -516,6 +516,7 @@ class Form4Holding:
 
 @dataclass(slots=True)
 class Form4Filing:
+
     accession_number: str
     issuer_cik: str | None = None
     issuer_name: str | None = None
