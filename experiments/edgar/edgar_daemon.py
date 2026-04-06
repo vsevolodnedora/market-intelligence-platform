@@ -793,9 +793,22 @@ class IngestionDaemon:
             return
 
         while not self._shutdown.is_set():
+            # --- Non-lossy signaling: clear BEFORE checking for work. ---
+            # Any set() that arrives after this clear — whether during the
+            # lease query or during publish — will be visible to the wait()
+            # at the bottom so we never miss a wakeup.
+            self._outbox_wake.clear()
+
+            drained_any = False
             try:
-                events = await asyncio.to_thread(self.outbox.lease_pending, 50)
-                if events:
+                # --- Drain loop: keep leasing until the outbox is empty ---
+                # so bursts of >batch_size events are published without an
+                # intervening 2-second sleep between each batch.
+                while not self._shutdown.is_set():
+                    events = await asyncio.to_thread(self.outbox.lease_pending, 200)
+                    if not events:
+                        break  # outbox fully drained
+                    drained_any = True
                     METRICS.set_gauge("edgar_outbox_leased", float(len(events)))
                     if self._batch_publish_callback is not None:
                         # Batch publish — one fsync for the whole batch
@@ -844,6 +857,7 @@ class IngestionDaemon:
                                     self.outbox.mark_failed, env.event_id, str(exc), env.lease_token,
                                 )
                             METRICS.inc("edgar_outbox_failed_total", float(len(events)))
+                            break  # back off after a publish failure
                     else:
                         # Per-event publish (legacy path)
                         for env in events:
@@ -875,15 +889,23 @@ class IngestionDaemon:
                                     self.outbox.mark_failed, env.event_id, str(exc), env.lease_token,
                                 )
                                 METRICS.inc("edgar_outbox_failed_total")
-                # Update pending gauge on every cycle
+                # Update pending gauge after drain completes
                 METRICS.set_gauge("edgar_outbox_pending",
                                   float(await asyncio.to_thread(self.outbox.pending_count)))
                 METRICS.set_gauge("edgar_outbox_leased", 0.0)
             except Exception:
                 logger.exception("error in outbox publisher")
-            # Wait for a wake signal (set by _handle_retrieval after new events
-            # are committed) or fall back to a short poll as backstop.
-            self._outbox_wake.clear()
+
+            # If we drained work, loop immediately — a new wake signal may
+            # already be set from events committed while we were publishing.
+            if drained_any:
+                continue
+
+            # Nothing was pending: wait for a wake signal or fall back to a
+            # short poll as a backstop.  Because we cleared the event at the
+            # top of this iteration, any set() that occurred during the
+            # (empty) lease query is already visible and wait() returns
+            # immediately — no wakeup is lost.
             try:
                 await asyncio.wait_for(self._outbox_wake.wait(), timeout=2.0)
             except asyncio.TimeoutError:

@@ -312,6 +312,16 @@ def build_fund_event(
         key=lambda h: h.value_usd or 0,
         reverse=True,
     )[:20]
+
+    # Distinguish full holdings parse (N-PORT) from metadata-only
+    # (497, 485, N-CEN) so downstream consumers never confuse
+    # "no holdings extracted" with "holdings not applicable".
+    form_upper = (filing.form_type or "").upper()
+    if form_upper.startswith("N-PORT"):
+        parse_status = "complete"
+    else:
+        parse_status = "metadata_only"
+
     return EventEnvelope.new(
         subject=EventSubjects.FUND_FILING_PARSED,
         accession_number=accession_number,
@@ -325,6 +335,7 @@ def build_fund_event(
             "total_assets": filing.total_assets,
             "net_assets": filing.net_assets,
             "holding_count": filing.holding_count,
+            "parse_status": parse_status,
             "top_holdings": [
                 {
                     "issuer_name": h.issuer_name,

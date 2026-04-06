@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 from typing import Any
 
 from domain import (
@@ -29,39 +30,10 @@ from domain import (
 
 logger = get_logger(__name__)
 
-# Inline XBRL tag patterns (found in HTML documents)
-_IXBRL_TAG_RE = re.compile(
-    r"<(?:ix|ixt?):(\w+)"
-    r"(?:\s[^>]*)?"
-    r"(?:contextRef=[\"']([^\"']*)[\"'])?"
-    r"(?:\s[^>]*)?"
-    r"(?:name=[\"']([^\"']*)[\"'])?"
-    r"(?:\s[^>]*)?"
-    r"(?:unitRef=[\"']([^\"']*)[\"'])?"
-    r"(?:\s[^>]*)?"
-    r"(?:decimals=[\"']([^\"']*)[\"'])?"
-    r"[^>]*>"
-    r"([^<]*)"
-    r"</(?:ix|ixt?):\1>",
-    re.IGNORECASE | re.DOTALL,
-)
-
-# More targeted pattern for ix:nonFraction and ix:nonNumeric
-_IXBRL_NONFRAC_RE = re.compile(
-    r"<ix:(?:nonFraction|nonNumeric)\s+"
-    r"[^>]*?"
-    r"name=[\"']([^\"']+)[\"']"
-    r"[^>]*?"
-    r"(?:contextRef=[\"']([^\"']*)[\"'])?"
-    r"[^>]*?"
-    r"(?:unitRef=[\"']([^\"']*)[\"'])?"
-    r"[^>]*?"
-    r"(?:decimals=[\"']([^\"']*)[\"'])?"
-    r"[^>]*?>"
-    r"([^<]*)"
-    r"</ix:(?:nonFraction|nonNumeric)>",
-    re.IGNORECASE | re.DOTALL,
-)
+# iXBRL element local names that represent facts
+_IXBRL_FACT_TAGS = frozenset({"nonfraction", "nonnumeric"})
+# Tags that can continue a fact's text content
+_IXBRL_CONTINUATION_TAG = "continuation"
 
 # Key financial concepts we especially want to capture
 _KEY_CONCEPTS = frozenset({
@@ -265,32 +237,197 @@ def _parse_xbrl_instance(xml_bytes: bytes, accession_number: str) -> tuple[list[
     return facts, contexts
 
 
+class _IXBRLParser(HTMLParser):
+    """HTMLParser subclass that extracts iXBRL facts from inline XBRL HTML.
+
+    Handles:
+    - Attributes in any order (contextRef, name, unitRef, decimals, etc.)
+    - Nested markup inside fact elements (collects all inner text recursively)
+    - ``ix:continuation`` elements linked via ``continuedAt`` / ``id`` attrs
+    - ``scale`` and ``sign`` attributes on ix:nonFraction
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        # Completed raw facts: list of dicts with attrs + collected text
+        self.raw_facts: list[dict[str, str | None]] = []
+        # Continuation blocks keyed by their id
+        self.continuations: dict[str, str] = {}
+
+        # --- parser state ---
+        # Stack depth for the current fact element (handles nested ix tags)
+        self._fact_depth: int = 0
+        self._fact_attrs: dict[str, str | None] = {}
+        self._fact_text_parts: list[str] = []
+        self._in_fact: bool = False
+        # ix:continuation tracking
+        self._in_continuation: bool = False
+        self._continuation_depth: int = 0
+        self._continuation_id: str | None = None
+        self._continuation_parts: list[str] = []
+        # General nesting depth for any ix: tag (to track close tags)
+        self._ix_tag_stack: list[str] = []
+
+    @staticmethod
+    def _is_ix_tag(tag: str) -> tuple[bool, str]:
+        """Return (is_ix_namespace, local_name_lower) for a tag."""
+        if ":" in tag:
+            prefix, local = tag.split(":", 1)
+            if prefix.lower() in ("ix", "ixt"):
+                return True, local.lower()
+        return False, tag.lower()
+
+    # --- HTMLParser callbacks ---
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        is_ix, local = self._is_ix_tag(tag)
+
+        if self._in_fact:
+            self._fact_depth += 1
+            return
+
+        if self._in_continuation:
+            self._continuation_depth += 1
+            return
+
+        if not is_ix:
+            return
+
+        if local in _IXBRL_FACT_TAGS:
+            attr_dict = {k.lower(): v for k, v in attrs}
+            self._in_fact = True
+            self._fact_depth = 1
+            self._fact_attrs = {
+                "tag_type": local,
+                "name": attr_dict.get("name"),
+                "contextref": attr_dict.get("contextref"),
+                "unitref": attr_dict.get("unitref"),
+                "decimals": attr_dict.get("decimals"),
+                "scale": attr_dict.get("scale"),
+                "sign": attr_dict.get("sign"),
+                "format": attr_dict.get("format"),
+                "continuedat": attr_dict.get("continuedat"),
+                "id": attr_dict.get("id"),
+            }
+            self._fact_text_parts = []
+        elif local == _IXBRL_CONTINUATION_TAG:
+            attr_dict = {k.lower(): v for k, v in attrs}
+            self._in_continuation = True
+            self._continuation_depth = 1
+            self._continuation_id = attr_dict.get("id")
+            self._continuation_parts = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._in_fact:
+            self._fact_depth -= 1
+            if self._fact_depth <= 0:
+                self._in_fact = False
+                self._fact_attrs["_text"] = "".join(self._fact_text_parts)
+                self.raw_facts.append(self._fact_attrs)
+                self._fact_attrs = {}
+                self._fact_text_parts = []
+            return
+
+        if self._in_continuation:
+            self._continuation_depth -= 1
+            if self._continuation_depth <= 0:
+                self._in_continuation = False
+                cid = self._continuation_id
+                if cid:
+                    self.continuations[cid] = "".join(self._continuation_parts)
+                self._continuation_id = None
+                self._continuation_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._in_fact:
+            self._fact_text_parts.append(data)
+        elif self._in_continuation:
+            self._continuation_parts.append(data)
+
+
+def _apply_ixbrl_scaling(value_str: str, scale: str | None, sign: str | None) -> str:
+    """Apply iXBRL scale and sign transformations to a numeric value string.
+
+    ``scale`` is an integer exponent: the raw value is multiplied by 10**scale.
+    ``sign`` of ``"-"`` negates the value.
+    """
+    if not scale and not sign:
+        return value_str
+    numeric = _safe_float(value_str)
+    if numeric is None:
+        return value_str
+    if scale:
+        try:
+            numeric = numeric * (10 ** int(scale))
+        except (ValueError, TypeError):
+            pass
+    if sign == "-":
+        numeric = -abs(numeric)
+    # Format without unnecessary trailing zeros
+    if numeric == int(numeric):
+        return str(int(numeric))
+    return str(numeric)
+
+
+def _resolve_continuations(raw_facts: list[dict[str, str | None]], continuations: dict[str, str]) -> None:
+    """Follow ``continuedAt`` chains and append continuation text to facts in-place."""
+    for fact in raw_facts:
+        cont_id = fact.get("continuedat")
+        parts: list[str] = []
+        seen: set[str] = set()
+        while cont_id and cont_id not in seen:
+            seen.add(cont_id)
+            text = continuations.get(cont_id, "")
+            if text:
+                parts.append(text)
+            # continuations themselves can chain — not common, but spec-valid
+            # (we don't track chained continuedAt here; would need richer data)
+            break
+        if parts:
+            existing = fact.get("_text") or ""
+            fact["_text"] = existing + " ".join(parts)
+
+
 def _parse_ixbrl(html_bytes: bytes, accession_number: str) -> list[XBRLFact]:
-    """Parse inline XBRL facts from an HTML document."""
+    """Parse inline XBRL facts from an HTML document using structured HTML parsing."""
     facts: list[XBRLFact] = []
     text = html_bytes.decode("utf-8", errors="replace")
 
-    for m in _IXBRL_NONFRAC_RE.finditer(text):
-        concept = m.group(1)
-        context_ref = m.group(2)
-        unit_ref = m.group(3)
-        decimals = m.group(4)
-        value = m.group(5).strip()
+    parser = _IXBRLParser()
+    try:
+        parser.feed(text)
+    except Exception:
+        logger.debug("iXBRL HTML parse failed for %s", accession_number)
+        return facts
 
-        if not value:
+    # Resolve continuations
+    _resolve_continuations(parser.raw_facts, parser.continuations)
+
+    for raw in parser.raw_facts:
+        concept = raw.get("name")
+        if not concept:
             continue
 
         # Filter to interesting prefixes
         if not any(concept.startswith(p) for p in _INTERESTING_PREFIXES):
             continue
 
+        value = (raw.get("_text") or "").strip()
+        if not value:
+            continue
+
+        # Apply iXBRL scale/sign for numeric facts
+        tag_type = raw.get("tag_type")
+        if tag_type == "nonfraction":
+            value = _apply_ixbrl_scaling(value, raw.get("scale"), raw.get("sign"))
+
         fact = XBRLFact(
             concept=concept,
             value=value,
             numeric_value=_safe_float(value),
-            unit=unit_ref,
-            decimals=decimals,
-            context_id=context_ref,
+            unit=raw.get("unitref"),
+            decimals=raw.get("decimals"),
+            context_id=raw.get("contextref"),
         )
         facts.append(fact)
 

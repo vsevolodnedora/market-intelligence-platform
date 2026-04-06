@@ -101,12 +101,13 @@ class EventEnvelope:
     consumers **must** treat ``event_id`` as a hard idempotency key and
     deduplicate accordingly.
 
-    **Correction semantics:**
-    When a filing is re-parsed and the payload changes, a new revision of
-    the same ``event_id`` is emitted.  The ``payload_hash`` field allows
-    the outbox to detect changed payloads and re-queue previously-published
-    events for republication.  Consumers should use the highest
-    ``commit_seq`` for a given ``event_id`` as the authoritative version.
+    **Correction / revision semantics:**
+    When a filing is re-parsed and the payload changes, a new immutable
+    revision row is inserted into the outbox with the same ``event_id``
+    but a different ``payload_hash``.  Prior revisions are preserved for
+    full historical reconstruction and audit.  Consumers should use the
+    highest ``commit_seq`` for a given ``event_id`` as the authoritative
+    version.
     """
     event_id: str
     subject: str
@@ -155,7 +156,7 @@ class EventEnvelope:
 _OUTBOX_SCHEMA = """
 CREATE TABLE IF NOT EXISTS outbox_events (
     commit_seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_id TEXT NOT NULL UNIQUE,
+    event_id TEXT NOT NULL,
     accession_number TEXT NOT NULL,
     subject TEXT NOT NULL,
     payload_json TEXT NOT NULL,
@@ -175,6 +176,10 @@ CREATE INDEX IF NOT EXISTS idx_outbox_status
     ON outbox_events(status, next_attempt_at);
 CREATE INDEX IF NOT EXISTS idx_outbox_accession
     ON outbox_events(accession_number);
+CREATE INDEX IF NOT EXISTS idx_outbox_event_id
+    ON outbox_events(event_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_event_payload
+    ON outbox_events(event_id, payload_hash);
 """
 
 # Maximum publish attempts before marking as permanently failed
@@ -239,20 +244,80 @@ class OutboxStore:
             conn.execute("ALTER TABLE outbox_events ADD COLUMN committed_at TEXT")
             logger.info("outbox migration: added committed_at column for transaction-time accuracy")
 
+        # --- Migration: remove legacy UNIQUE constraint on event_id ---
+        # Old schemas had ``event_id TEXT NOT NULL UNIQUE`` which prevents
+        # storing multiple immutable revision rows per event_id.  SQLite
+        # cannot drop a column-level UNIQUE constraint, so we detect the
+        # autoindex and recreate the table without it.
+        has_unique_event_id = any(
+            row[1] == "sqlite_autoindex_outbox_events_1"
+            for row in conn.execute("PRAGMA index_list(outbox_events)").fetchall()
+        )
+        if has_unique_event_id:
+            logger.info(
+                "outbox migration: removing UNIQUE constraint on event_id "
+                "to support immutable revision rows"
+            )
+            conn.executescript("""
+                CREATE TABLE outbox_events_new (
+                    commit_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL,
+                    accession_number TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    publish_attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TEXT,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    committed_at TEXT,
+                    published_at TEXT,
+                    leased_at TEXT,
+                    lease_token TEXT
+                );
+                INSERT INTO outbox_events_new
+                    (commit_seq, event_id, accession_number, subject, payload_json,
+                     payload_hash, status, publish_attempts, next_attempt_at,
+                     last_error, created_at, committed_at, published_at,
+                     leased_at, lease_token)
+                SELECT commit_seq, event_id, accession_number, subject, payload_json,
+                       payload_hash, status, publish_attempts, next_attempt_at,
+                       last_error, created_at, committed_at, published_at,
+                       leased_at, lease_token
+                FROM outbox_events;
+                DROP TABLE outbox_events;
+                ALTER TABLE outbox_events_new RENAME TO outbox_events;
+                CREATE INDEX IF NOT EXISTS idx_outbox_status
+                    ON outbox_events(status, next_attempt_at);
+                CREATE INDEX IF NOT EXISTS idx_outbox_accession
+                    ON outbox_events(accession_number);
+                CREATE INDEX IF NOT EXISTS idx_outbox_event_id
+                    ON outbox_events(event_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_event_payload
+                    ON outbox_events(event_id, payload_hash);
+                CREATE INDEX IF NOT EXISTS idx_outbox_commit_seq
+                    ON outbox_events(status, commit_seq);
+            """)
+            logger.info("outbox migration: table recreated without UNIQUE on event_id")
+
     # --- Transactional writes (caller owns the connection & transaction) ---
 
     def insert_event(self, conn: sqlite3.Connection, envelope: EventEnvelope) -> None:
         """Insert a single outbox event — caller must commit.
 
-        **Correction semantics:** If an event with the same ``event_id``
-        already exists but the ``payload_hash`` differs (i.e. a reparse
-        produced different data), the existing row is updated with the new
-        payload and reset to ``pending`` so downstream consumers receive
-        the corrected version.  If the payload is unchanged, the row is
-        left as-is (idempotent no-op).
+        **Immutable revision semantics:** Each call inserts a new row.  If an
+        event with the same ``event_id`` *and* ``payload_hash`` already exists,
+        the insert is a no-op (idempotent).  If the same ``event_id`` is
+        emitted with a *different* ``payload_hash``, a brand-new revision row
+        is inserted and queued as ``pending``.  Prior revisions are **never**
+        modified or deleted — they remain fully queryable for audit / replay.
 
-        After insert/update, the DB-assigned ``commit_seq`` is written
-        back onto the envelope for downstream use.
+        Downstream consumers should use the highest ``commit_seq`` for a given
+        ``event_id`` as the authoritative version.
+
+        After insert, the DB-assigned ``commit_seq`` is written back onto the
+        envelope for downstream use.
         """
         payload_json = dump_json(envelope.payload)
         payload_hash = envelope.payload_hash or hashlib.sha256(payload_json.encode()).hexdigest()[:16]
@@ -262,80 +327,73 @@ class OutboxStore:
         # and ordering purposes.
         committed_now = utcnow().isoformat()
 
-        # Check if this event_id already exists
+        # Check if an identical revision (same event_id + payload_hash) exists.
+        # The UNIQUE index on (event_id, payload_hash) enforces this at the DB
+        # level, but we check explicitly to distinguish "idempotent no-op" from
+        # "new revision" for logging and commit_seq back-fill.
         existing = conn.execute(
-            "SELECT commit_seq, payload_hash, status FROM outbox_events WHERE event_id = ?",
-            (envelope.event_id,),
+            "SELECT commit_seq FROM outbox_events "
+            "WHERE event_id = ? AND payload_hash = ?",
+            (envelope.event_id, payload_hash),
         ).fetchone()
 
-        if existing is None:
-            # Fresh insert — commit_seq auto-increments on fresh schemas.
+        if existing is not None:
+            # Identical payload already stored — idempotent no-op.
+            envelope.commit_seq = existing[0] if existing[0] is not None else existing["commit_seq"]
+            return
+
+        # Either a brand-new event_id or a correction with a different
+        # payload_hash.  Insert a new immutable revision row.
+        is_correction = conn.execute(
+            "SELECT 1 FROM outbox_events WHERE event_id = ? LIMIT 1",
+            (envelope.event_id,),
+        ).fetchone() is not None
+
+        conn.execute(
+            """INSERT INTO outbox_events
+               (event_id, accession_number, subject, payload_json, payload_hash,
+                status, publish_attempts, created_at, committed_at)
+               VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)""",
+            (
+                envelope.event_id,
+                envelope.accession_number,
+                envelope.subject,
+                payload_json,
+                payload_hash,
+                envelope.created_at,
+                committed_now,
+            ),
+        )
+        envelope.committed_at = committed_now
+
+        # For migrated schemas where commit_seq is a plain column (not PK),
+        # it will be NULL after the insert above.  Backfill it from the max.
+        row = conn.execute(
+            "SELECT commit_seq FROM outbox_events "
+            "WHERE event_id = ? AND payload_hash = ?",
+            (envelope.event_id, payload_hash),
+        ).fetchone()
+        if row and row[0] is None:
+            next_seq = conn.execute(
+                "SELECT COALESCE(MAX(commit_seq), 0) + 1 FROM outbox_events"
+            ).fetchone()[0]
             conn.execute(
-                """INSERT INTO outbox_events
-                   (event_id, accession_number, subject, payload_json, payload_hash,
-                    status, publish_attempts, created_at, committed_at)
-                   VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)""",
-                (
-                    envelope.event_id,
-                    envelope.accession_number,
-                    envelope.subject,
-                    payload_json,
-                    payload_hash,
-                    envelope.created_at,
-                    committed_now,
-                ),
+                "UPDATE outbox_events SET commit_seq = ? "
+                "WHERE event_id = ? AND payload_hash = ?",
+                (next_seq, envelope.event_id, payload_hash),
             )
-            envelope.committed_at = committed_now
-            # For migrated schemas where commit_seq is a plain column (not PK),
-            # it will be NULL after the insert above.  Backfill it from the max.
-            row = conn.execute(
-                "SELECT commit_seq FROM outbox_events WHERE event_id = ?",
-                (envelope.event_id,),
-            ).fetchone()
-            if row and row[0] is None:
-                next_seq = conn.execute(
-                    "SELECT COALESCE(MAX(commit_seq), 0) + 1 FROM outbox_events"
-                ).fetchone()[0]
-                conn.execute(
-                    "UPDATE outbox_events SET commit_seq = ? WHERE event_id = ?",
-                    (next_seq, envelope.event_id),
-                )
-                envelope.commit_seq = next_seq
-            elif row:
-                envelope.commit_seq = row[0]
-        else:
-            # Event already exists — check for correction
-            old_hash = existing["payload_hash"] if existing["payload_hash"] else ""
-            if old_hash != payload_hash:
-                # Payload changed: update and re-queue for publication.
-                # CRITICAL: assign a new monotonic commit_seq so downstream
-                # consumers can reliably order corrections.  The documented
-                # contract is "highest commit_seq for a given event_id wins";
-                # preserving the old commit_seq would violate that invariant.
-                next_seq = conn.execute(
-                    "SELECT COALESCE(MAX(commit_seq), 0) + 1 FROM outbox_events"
-                ).fetchone()[0]
-                conn.execute(
-                    """UPDATE outbox_events
-                       SET payload_json = ?, payload_hash = ?,
-                           status = 'pending', publish_attempts = 0,
-                           published_at = NULL, last_error = NULL,
-                           next_attempt_at = NULL, leased_at = NULL,
-                           lease_token = NULL, created_at = ?,
-                           commit_seq = ?, committed_at = ?
-                       WHERE event_id = ?""",
-                    (payload_json, payload_hash, envelope.created_at, next_seq, committed_now, envelope.event_id),
-                )
-                envelope.commit_seq = next_seq
-                envelope.committed_at = committed_now
-                logger.info(
-                    "correction detected for event_id=%s subject=%s: "
-                    "payload changed (old_hash=%s new_hash=%s), re-queued with commit_seq=%d",
-                    envelope.event_id, envelope.subject, old_hash, payload_hash, next_seq,
-                )
-            else:
-                # Identical payload — idempotent no-op
-                envelope.commit_seq = existing["commit_seq"]
+            envelope.commit_seq = next_seq
+        elif row:
+            envelope.commit_seq = row[0]
+
+        if is_correction:
+            logger.info(
+                "correction detected for event_id=%s subject=%s: "
+                "new revision inserted (new_hash=%s) with commit_seq=%s; "
+                "prior revisions preserved",
+                envelope.event_id, envelope.subject, payload_hash,
+                envelope.commit_seq,
+            )
 
     def insert_events(self, conn: sqlite3.Connection, envelopes: list[EventEnvelope]) -> None:
         """Insert multiple outbox events — caller must commit."""
@@ -344,7 +402,7 @@ class OutboxStore:
 
     # --- Publisher-side reads (own connection) ---
 
-    def lease_pending(self, limit: int = 50, lease_seconds: int = 60) -> list[EventEnvelope]:
+    def lease_pending(self, limit: int = 200, lease_seconds: int = 60) -> list[EventEnvelope]:
         """Claim up to *limit* pending events for publication.
         Before selecting candidates, any rows whose lease has expired
         (leased longer than ``lease_seconds`` ago) are reclaimed back to
@@ -352,6 +410,10 @@ class OutboxStore:
 
         Events are leased in ``commit_seq`` order — a DB-assigned monotonic
         sequence that reflects true commit order, not wall-clock timestamps.
+
+        Callers should invoke this method in a **drain loop** — calling
+        repeatedly until the returned list is empty — so that backlogs
+        larger than *limit* are fully drained before the caller sleeps.
         """
         now = utcnow()
         now_iso = now.isoformat()
@@ -386,8 +448,8 @@ class OutboxStore:
                 cursor = conn.execute(
                     """UPDATE outbox_events
                        SET status = 'leased', leased_at = ?, lease_token = ?
-                       WHERE event_id = ? AND status = 'pending'""",
-                    (now_iso, token, row["event_id"]),
+                       WHERE commit_seq = ? AND status = 'pending'""",
+                    (now_iso, token, row["commit_seq"]),
                 )
                 if cursor.rowcount == 1:
                     results.append(EventEnvelope(
@@ -404,14 +466,41 @@ class OutboxStore:
             conn.commit()
         return results
 
-    def mark_published(self, event_id: str, lease_token: str | None = None) -> bool:
-        """Mark an event as published.
+    def mark_published(
+        self,
+        event_id: str,
+        lease_token: str | None = None,
+        *,
+        commit_seq: int | None = None,
+    ) -> bool:
+        """Mark an event revision as published.
+
+        When ``commit_seq`` is provided it is used as the primary row key,
+        which is required now that multiple revision rows can share the same
+        ``event_id``.  The ``event_id`` parameter is kept for backward
+        compatibility but is only used when ``commit_seq`` is ``None``.
 
         Returns True if the row was updated, False if the lease was stale.
         """
         now_iso = utcnow().isoformat()
         with self.storage._conn() as conn:
-            if lease_token is not None:
+            if commit_seq is not None and lease_token is not None:
+                cursor = conn.execute(
+                    """UPDATE outbox_events
+                       SET status = 'published', published_at = ?, last_error = NULL,
+                           lease_token = NULL
+                       WHERE commit_seq = ? AND status = 'leased' AND lease_token = ?""",
+                    (now_iso, commit_seq, lease_token),
+                )
+            elif commit_seq is not None:
+                cursor = conn.execute(
+                    """UPDATE outbox_events
+                       SET status = 'published', published_at = ?, last_error = NULL,
+                           lease_token = NULL
+                       WHERE commit_seq = ?""",
+                    (now_iso, commit_seq),
+                )
+            elif lease_token is not None:
                 cursor = conn.execute(
                     """UPDATE outbox_events
                        SET status = 'published', published_at = ?, last_error = NULL,
@@ -431,28 +520,45 @@ class OutboxStore:
             conn.commit()
             if lease_token is not None and cursor.rowcount == 0:
                 logger.warning(
-                    "mark_published: stale lease for event_id=%s (token mismatch or expired)",
-                    event_id,
+                    "mark_published: stale lease for event_id=%s commit_seq=%s "
+                    "(token mismatch or expired)",
+                    event_id, commit_seq,
                 )
                 return False
             return True
 
-    def mark_failed(self, event_id: str, error: str, lease_token: str | None = None) -> bool:
+    def mark_failed(
+        self,
+        event_id: str,
+        error: str,
+        lease_token: str | None = None,
+        *,
+        commit_seq: int | None = None,
+    ) -> bool:
         """Record a publish failure with exponential backoff for next attempt.
+
+        When ``commit_seq`` is provided it is used as the primary row key,
+        which is required now that multiple revision rows can share the same
+        ``event_id``.
 
         When a ``lease_token`` is provided, the update is guarded by
         ``status = 'leased' AND lease_token = ?`` in a **single** UPDATE
         statement — matching the ``mark_published()`` pattern.  This
         prevents the stale-lease TOCTOU race.
-        A stale publisher can no longer pass a SELECT check, lose
-        ownership, and then overwrite a now-published row.
         """
         now = utcnow()
         with self.storage._conn() as conn:
-            row = conn.execute(
-                "SELECT publish_attempts FROM outbox_events WHERE event_id = ?",
-                (event_id,),
-            ).fetchone()
+            # Look up current attempts — prefer commit_seq when available
+            if commit_seq is not None:
+                row = conn.execute(
+                    "SELECT publish_attempts FROM outbox_events WHERE commit_seq = ?",
+                    (commit_seq,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT publish_attempts FROM outbox_events WHERE event_id = ?",
+                    (event_id,),
+                ).fetchone()
             attempts = (row["publish_attempts"] if row else 0) + 1
             if attempts >= MAX_PUBLISH_ATTEMPTS:
                 new_status = "failed"
@@ -462,7 +568,32 @@ class OutboxStore:
                 backoff = min(3600, self._publish_retry_base * (2 ** attempts))
                 next_at = (now + timedelta(seconds=backoff)).isoformat()
 
-            if lease_token is not None:
+            if commit_seq is not None and lease_token is not None:
+                cursor = conn.execute(
+                    """UPDATE outbox_events
+                       SET status = ?, publish_attempts = ?, last_error = ?,
+                           next_attempt_at = ?, leased_at = NULL, lease_token = NULL
+                       WHERE commit_seq = ? AND status = 'leased' AND lease_token = ?""",
+                    (new_status, attempts, error[:1000], next_at, commit_seq, lease_token),
+                )
+                conn.commit()
+                if cursor.rowcount == 0:
+                    logger.warning(
+                        "mark_failed: stale lease for event_id=%s commit_seq=%s "
+                        "(token mismatch or expired)",
+                        event_id, commit_seq,
+                    )
+                    return False
+            elif commit_seq is not None:
+                conn.execute(
+                    """UPDATE outbox_events
+                       SET status = ?, publish_attempts = ?, last_error = ?,
+                           next_attempt_at = ?, leased_at = NULL, lease_token = NULL
+                       WHERE commit_seq = ?""",
+                    (new_status, attempts, error[:1000], next_at, commit_seq),
+                )
+                conn.commit()
+            elif lease_token is not None:
                 # Single conditional UPDATE — no separate pre-check.
                 cursor = conn.execute(
                     """UPDATE outbox_events
@@ -807,6 +938,8 @@ class FilingCommitService:
         canonical_name_normalized: str | None = None,
         txt_path: str | None = None,
         txt_sha256: str | None = None,
+        raw_index_path: str | None = None,
+        index_sha256: str | None = None,
         primary_doc_path: str | None = None,
         primary_sha256: str | None = None,
         primary_document_url: str | None = None,
@@ -838,6 +971,8 @@ class FilingCommitService:
             canonical_name_normalized = bundle.canonical_name_normalized
             txt_path = bundle.txt_path
             txt_sha256 = bundle.txt_sha256
+            raw_index_path = bundle.index_path
+            index_sha256 = bundle.index_sha256
             primary_doc_path = bundle.primary_doc_path
             primary_sha256 = bundle.primary_sha256
             primary_document_url = bundle.primary_document_url
@@ -1046,15 +1181,15 @@ class FilingCommitService:
                 """UPDATE filings SET
                     retrieval_status=?, updated_at=?, last_attempt_at=?,
                     attempt_count=?, next_retry_at=?,
-                    raw_txt_path=?, primary_doc_path=?,
-                    txt_sha256=?, primary_sha256=?,
+                    raw_txt_path=?, raw_index_path=?, primary_doc_path=?,
+                    txt_sha256=?, index_sha256=?, primary_sha256=?,
                     primary_document_url=COALESCE(?, primary_document_url)
                 WHERE accession_number=?""",
                 (
                     final_status, now_iso, now_iso, current_attempts,
                     next_retry_iso,
-                    txt_path, primary_doc_path,
-                    txt_sha256, primary_sha256,
+                    txt_path, raw_index_path, primary_doc_path,
+                    txt_sha256, index_sha256, primary_sha256,
                     primary_document_url,
                     accession_number,
                 ),

@@ -704,6 +704,8 @@ class RetrievedFilingBundle:
     # Artifact paths + hashes (already written atomically)
     txt_path: str | None = None
     txt_sha256: str | None = None
+    index_path: str | None = None
+    index_sha256: str | None = None
     primary_doc_path: str | None = None
     primary_sha256: str | None = None
     primary_document_url: str | None = None

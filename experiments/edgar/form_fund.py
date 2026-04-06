@@ -157,12 +157,22 @@ class FundHandler:
             form_upper = (header.form_type or "").upper().strip()
             filing: FundFiling | None = None
 
-            # N-PORT filings are XML-structured
+            # N-PORT filings are XML-structured — do NOT fall back to
+            # the generic text parser on failure, because that would
+            # silently produce a metadata-only FundFiling that is
+            # indistinguishable from a successful parse with zero
+            # holdings, contaminating downstream datasets.
             if form_upper.startswith("N-PORT"):
                 filing = _parse_nport_xml(primary_bytes, accession_number)
-
-            # Fallback to text parse for all other fund forms
-            if filing is None:
+                if filing is None:
+                    logger.warning(
+                        "N-PORT XML parse returned None for %s; "
+                        "returning parse failure (no text fallback)",
+                        accession_number,
+                    )
+                    return None
+            else:
+                # Non-N-PORT fund forms (497, 485, N-CEN) use text parse
                 text = primary_bytes.decode("utf-8", errors="replace")
                 filing = _parse_fund_text(text, accession_number, header, discovery)
 

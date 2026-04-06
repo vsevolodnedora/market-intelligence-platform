@@ -240,6 +240,8 @@ class FilingRetriever:
             primary_url: str | None = None
             extracted_bytes: bytes | None = None
             artifact: FilingArtifact | None = None
+            index_path_str: str | None = None
+            index_hash: str | None = None
 
             # When header parsing produces no documents and
             # discovery.primary_document_url is absent, target_filename is
@@ -253,6 +255,10 @@ class FilingRetriever:
                 index_url = derive_index_url(cik, acc)
                 try:
                     index_bytes, _ = await self.client.get_bytes(index_url)
+                    # Persist the index artifact
+                    idx_path = acc_dir / f"{acc}-index.html"
+                    index_hash = await self._artifact_writer.write_atomic_async(idx_path, index_bytes)
+                    index_path_str = str(idx_path)
                     alt = choose_primary_document(
                         index_bytes.decode("utf-8", errors="replace"),
                         index_url, form_type=header.form_type,
@@ -288,6 +294,11 @@ class FilingRetriever:
                     index_url = derive_index_url(cik, acc)
                     try:
                         index_bytes, _ = await self.client.get_bytes(index_url)
+                        # Persist the index artifact if not already written
+                        if index_path_str is None:
+                            idx_path = acc_dir / f"{acc}-index.html"
+                            index_hash = await self._artifact_writer.write_atomic_async(idx_path, index_bytes)
+                            index_path_str = str(idx_path)
                         alt = choose_primary_document(
                             index_bytes.decode("utf-8", errors="replace"),
                             index_url, form_type=header.form_type,
@@ -378,6 +389,8 @@ class FilingRetriever:
                 canonical_name_normalized=canonical.name_normalized if canonical else None,
                 txt_path=str(txt_path),
                 txt_sha256=txt_hash,
+                index_path=index_path_str,
+                index_sha256=index_hash,
                 primary_doc_path=pdoc_path_str,
                 primary_sha256=pdoc_hash,
                 primary_document_url=primary_url,
@@ -428,8 +441,10 @@ class FilingRetriever:
                         acc, final_status_inner,
                         retry_base_seconds=self.retry_base_seconds,
                         raw_txt_path=str(txt_path),
+                        raw_index_path=index_path_str,
                         primary_doc_path=pdoc_path_str,
                         txt_sha256=txt_hash,
+                        index_sha256=index_hash,
                         primary_sha256=pdoc_hash,
                         primary_document_url=primary_url,
                     )
