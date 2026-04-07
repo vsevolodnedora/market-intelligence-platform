@@ -57,8 +57,8 @@ class ArchivalStats:
     __slots__ = (
         "filings_scanned", "filings_archived", "filings_skipped",
         "filings_failed", "files_copied", "files_deleted",
-        "bytes_copied", "jsonl_files_archived", "errors",
-        "start_time",
+        "bytes_copied", "jsonl_files_archived", "orphans_cleaned",
+        "errors", "start_time",
     )
 
     def __init__(self) -> None:
@@ -70,6 +70,7 @@ class ArchivalStats:
         self.files_deleted = 0
         self.bytes_copied = 0
         self.jsonl_files_archived = 0
+        self.orphans_cleaned = 0
         self.errors: list[str] = []
         self.start_time = time.monotonic()
 
@@ -84,6 +85,7 @@ class ArchivalStats:
             f"skipped={self.filings_skipped} failed={self.filings_failed} "
             f"files_copied={self.files_copied} files_deleted={self.files_deleted} "
             f"bytes_copied={self.bytes_copied} jsonl={self.jsonl_files_archived} "
+            f"orphans_cleaned={self.orphans_cleaned} "
             f"errors={len(self.errors)}"
         )
 
@@ -194,6 +196,70 @@ def _streaming_sha256(path: Path) -> str:
                 break
             h.update(chunk)
     return h.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Pending-deletion persistence — tracks old paths that still need cleanup
+# ---------------------------------------------------------------------------
+
+def _ensure_pending_deletions_table(storage: SQLiteStorage) -> None:
+    """Create the ``pending_deletions`` table if it does not exist.
+
+    Each row records a source file that should have been deleted after
+    ``rewrite_artifact_locations()`` committed new archive paths.  If the
+    delete failed (permissions, NFS stale handle, etc.) the row survives
+    so that ``cleanup_orphaned_originals()`` can retry on the next run.
+    """
+    with storage._conn() as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS pending_deletions ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  accession_number TEXT NOT NULL,"
+            "  original_path TEXT NOT NULL,"
+            "  archived_path TEXT NOT NULL,"
+            "  expected_sha256 TEXT,"
+            "  created_at TEXT NOT NULL,"
+            "  UNIQUE(accession_number, original_path)"
+            ")"
+        )
+
+
+def _record_pending_deletions(
+    storage: SQLiteStorage,
+    accession_number: str,
+    src_dst_pairs: list[tuple[Path, Path]],
+    hash_map: dict[str, str | None],
+) -> None:
+    """Persist *src_dst_pairs* so cleanup can find them if deletion fails.
+
+    *hash_map* maps ``str(src)`` → expected SHA-256 (or ``None``).
+    """
+    now = utcnow().isoformat()
+    with storage._conn() as conn:
+        for src, dst in src_dst_pairs:
+            if src.resolve() == dst.resolve():
+                continue  # no deletion needed for identity pairs
+            conn.execute(
+                "INSERT OR IGNORE INTO pending_deletions "
+                "(accession_number, original_path, archived_path, expected_sha256, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    accession_number,
+                    str(src),
+                    str(dst),
+                    hash_map.get(str(src)),
+                    now,
+                ),
+            )
+
+
+def _remove_pending_deletion(storage: SQLiteStorage, original_path: str) -> None:
+    """Remove a pending deletion after the original was successfully deleted."""
+    with storage._conn() as conn:
+        conn.execute(
+            "DELETE FROM pending_deletions WHERE original_path = ?",
+            (original_path,),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -418,7 +484,28 @@ def archive_filing(
         # retry.  DO NOT delete originals.
         return False
 
-    # Step 5: Delete originals only after DB commit succeeded
+    # Step 5a: Persist old paths so cleanup can retry if deletion fails.
+    # Build a hash map keyed by str(src) for the pending_deletions table.
+    hash_map: dict[str, str | None] = {}
+    if raw_txt_path:
+        hash_map[raw_txt_path] = txt_sha256
+    if primary_doc_path:
+        hash_map[primary_doc_path] = primary_sha256
+    for doc_row in doc_rows:
+        local_path = doc_row.get("local_path", "")
+        if local_path:
+            hash_map[local_path] = doc_row.get("sha256")
+
+    try:
+        _record_pending_deletions(storage, acc, archived_files, hash_map)
+    except Exception as exc:
+        # Non-fatal: the deletion will proceed, but if it fails the
+        # cleanup pass will have to rely on heuristic path reconstruction.
+        logger.warning(
+            "failed to record pending deletions for %s: %s", acc, exc,
+        )
+
+    # Step 5b: Delete originals only after DB commit succeeded
     for src, _dst in archived_files:
         # Critical safety guard: if src and dst resolve to the same file
         # (which happens when a previously-archived filing is re-selected),
@@ -431,7 +518,12 @@ def archive_filing(
         if src.exists():
             if _safe_delete(src):
                 stats.files_deleted += 1
-            # Step 6: If deletion fails, leave both copies — harmless
+                try:
+                    _remove_pending_deletion(storage, str(src))
+                except Exception:
+                    pass  # best-effort; cleanup pass will handle it
+            # Step 6: If deletion fails, leave both copies — the
+            # pending_deletions row ensures cleanup will retry later.
 
     # Try to clean up empty parent directories
     seen_parents: set[Path] = set()
@@ -553,6 +645,8 @@ def archive_jsonl_events(
                         stats.errors.append(f"JSONL {f.name}: re-copy failed: {exc}")
                 else:
                     _safe_delete(f)
+                    stats.jsonl_files_archived += 1
+                    logger.debug("archived JSONL %s (existing copy verified)", f.name)
             continue
 
         if dry_run:
@@ -586,6 +680,58 @@ def archive_jsonl_events(
 # Cleanup pass — retry deletion of orphaned originals
 # ---------------------------------------------------------------------------
 
+def _cleanup_one(
+    original: Path,
+    archived: Path,
+    expected_hash: str | None,
+    accession: str,
+    *,
+    dry_run: bool,
+) -> bool:
+    """Verify archive copy and delete an orphaned original.
+
+    Returns True if the original was deleted (or already gone).
+    """
+    if not original.exists():
+        return True  # already gone
+
+    if not archived.exists():
+        logger.warning(
+            "cleanup: archive copy missing for %s — keeping original %s",
+            accession, original,
+        )
+        return False
+
+    if expected_hash:
+        actual_hash = _streaming_sha256(archived)
+        if actual_hash != expected_hash:
+            logger.warning(
+                "cleanup: archive hash mismatch for %s (%s) — keeping original",
+                accession, archived,
+            )
+            return False
+
+    if dry_run:
+        logger.info("[DRY RUN] would delete orphaned original: %s", original)
+        return False
+
+    if _safe_delete(original):
+        logger.info(
+            "cleanup: deleted orphaned original %s (acc=%s)",
+            original, accession,
+        )
+        # Try to remove empty parent directories
+        try:
+            parent = original.parent
+            if parent.exists() and not any(parent.iterdir()):
+                parent.rmdir()
+        except OSError:
+            pass
+        return True
+
+    return False
+
+
 def cleanup_orphaned_originals(
     storage: SQLiteStorage,
     archive_dir: Path,
@@ -594,100 +740,129 @@ def cleanup_orphaned_originals(
     raw_dir: Path | None = None,
     dry_run: bool = False,
 ) -> None:
-    """Find files whose DB paths point to archive_dir but originals still exist.
+    """Retry deletion of orphaned originals left behind by prior runs.
 
-    This handles Step 6 from the plan: "If deletion fails, leave both
+    This implements the Step 6 promise: "If deletion fails, leave both
     copies in place and retry cleanup later."
 
-    Scans filings whose ``raw_txt_path`` or ``primary_doc_path`` already
-    reside under *archive_dir*.  For each, reconstructs the likely
-    original path under *raw_dir* (by replacing the archive prefix with
-    the raw prefix).  If the original still exists **and** the archive
-    copy matches the DB hash, the orphaned original is deleted.
+    Two complementary strategies are used:
 
-    When *raw_dir* is ``None`` the function is a no-op (cannot locate
-    orphaned originals without knowing the original storage root).
+    1. **pending_deletions table** (primary) — ``archive_filing()``
+       persists every old-path → new-path pair before attempting
+       deletion.  Rows that survive indicate a failed delete.  This
+       covers *all* artifact types including ``filing_documents``.
+
+    2. **Heuristic path reconstruction** (fallback) — for rows that
+       pre-date the ``pending_deletions`` table or where recording
+       failed, we reconstruct the candidate original path by replacing
+       the archive prefix with the raw-dir prefix.  Requires
+       *raw_dir* to be provided.
+
+    Both strategies verify the archive copy's integrity against the
+    expected hash before deleting the original.
     """
-    if raw_dir is None:
-        logger.debug("cleanup_orphaned_originals: skipped (no raw_dir provided)")
-        return
-
-    archive_prefix = str(archive_dir.resolve()).rstrip("/") + "/"
-    raw_prefix = str(raw_dir.resolve()).rstrip("/") + "/"
     cleaned = 0
 
-    # Query filings whose paths are already archived
-    with storage._conn() as conn:
-        rows = conn.execute(
-            "SELECT accession_number, raw_txt_path, primary_doc_path, "
-            "txt_sha256, primary_sha256 "
-            "FROM filings "
-            "WHERE retrieval_status = 'retrieved' "
-            "AND (raw_txt_path LIKE ? OR primary_doc_path LIKE ?)",
-            (str(archive_dir) + "%", str(archive_dir) + "%"),
-        ).fetchall()
+    # ------------------------------------------------------------------
+    # Strategy 1: pending_deletions table
+    # ------------------------------------------------------------------
+    _ensure_pending_deletions_table(storage)
+    try:
+        with storage._conn() as conn:
+            pending_rows = conn.execute(
+                "SELECT id, accession_number, original_path, archived_path, "
+                "expected_sha256 FROM pending_deletions"
+            ).fetchall()
+    except Exception as exc:
+        logger.warning("cleanup: could not read pending_deletions: %s", exc)
+        pending_rows = []
 
-    for row in rows:
-        for path_field, hash_field in [
-            ("raw_txt_path", "txt_sha256"),
-            ("primary_doc_path", "primary_sha256"),
-        ]:
-            archived_path_str = row[path_field]
-            if not archived_path_str:
-                continue
-            resolved = str(Path(archived_path_str).resolve())
-            if not resolved.startswith(archive_prefix):
-                continue
+    # Track originals handled via pending_deletions so strategy 2 skips them.
+    handled_originals: set[str] = set()
 
-            # Reconstruct candidate original path: replace archive prefix
-            # with raw prefix.  The CIK/accession subpath is preserved by
-            # _derive_archive_path, so this reversal is exact.
-            relative = resolved[len(archive_prefix):]
-            candidate_original = Path(raw_prefix + relative)
+    for prow in pending_rows:
+        original = Path(prow["original_path"])
+        archived = Path(prow["archived_path"])
+        expected_hash = prow["expected_sha256"]
+        accession = prow["accession_number"]
 
-            if not candidate_original.exists():
-                continue  # Nothing to clean up
+        handled_originals.add(str(original))
 
-            # Verify the archive copy is intact before deleting the original
-            archived_path = Path(archived_path_str)
-            expected_hash = row[hash_field]
-            if not archived_path.exists():
-                logger.warning(
-                    "cleanup: archive copy missing for %s — keeping original %s",
-                    row["accession_number"], candidate_original,
-                )
-                continue
+        if not original.exists():
+            # File is already gone — just clean up the stale tracking row.
+            if not dry_run:
+                try:
+                    _remove_pending_deletion(storage, str(original))
+                except Exception:
+                    pass
+            continue
 
-            if expected_hash:
-                actual_hash = _streaming_sha256(archived_path)
-                if actual_hash != expected_hash:
-                    logger.warning(
-                        "cleanup: archive hash mismatch for %s (%s) — keeping original",
-                        row["accession_number"], archived_path,
-                    )
+        deleted = _cleanup_one(
+            original, archived, expected_hash, accession, dry_run=dry_run,
+        )
+
+        if deleted:
+            cleaned += 1
+            stats.files_deleted += 1
+            if not dry_run:
+                try:
+                    _remove_pending_deletion(storage, str(original))
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------
+    # Strategy 2: heuristic path reconstruction (fallback)
+    # ------------------------------------------------------------------
+    if raw_dir is not None:
+        archive_prefix = str(archive_dir.resolve()).rstrip("/") + "/"
+        raw_prefix = str(raw_dir.resolve()).rstrip("/") + "/"
+
+        # Query filings whose paths are already archived
+        try:
+            with storage._conn() as conn:
+                rows = conn.execute(
+                    "SELECT accession_number, raw_txt_path, primary_doc_path, "
+                    "txt_sha256, primary_sha256 "
+                    "FROM filings "
+                    "WHERE retrieval_status = 'retrieved' "
+                    "AND (raw_txt_path LIKE ? OR primary_doc_path LIKE ?)",
+                    (str(archive_dir) + "%", str(archive_dir) + "%"),
+                ).fetchall()
+        except Exception as exc:
+            logger.warning("cleanup: heuristic query failed: %s", exc)
+            rows = []
+
+        for row in rows:
+            for path_field, hash_field in [
+                ("raw_txt_path", "txt_sha256"),
+                ("primary_doc_path", "primary_sha256"),
+            ]:
+                archived_path_str = row[path_field]
+                if not archived_path_str:
+                    continue
+                resolved = str(Path(archived_path_str).resolve())
+                if not resolved.startswith(archive_prefix):
                     continue
 
-            # Archive is verified — safe to delete the orphaned original
-            if dry_run:
-                logger.info(
-                    "[DRY RUN] would delete orphaned original: %s",
-                    candidate_original,
-                )
-            else:
-                if _safe_delete(candidate_original):
-                    cleaned += 1
-                    logger.info(
-                        "cleanup: deleted orphaned original %s (acc=%s)",
-                        candidate_original, row["accession_number"],
-                    )
-                    # Try to remove empty parent directories
-                    try:
-                        parent = candidate_original.parent
-                        if parent.exists() and not any(parent.iterdir()):
-                            parent.rmdir()
-                    except OSError:
-                        pass
+                relative = resolved[len(archive_prefix):]
+                candidate_original = Path(raw_prefix + relative)
 
+                # Skip if already handled by strategy 1
+                if str(candidate_original) in handled_originals:
+                    continue
+
+                deleted = _cleanup_one(
+                    candidate_original,
+                    Path(archived_path_str),
+                    row[hash_field],
+                    row["accession_number"],
+                    dry_run=dry_run,
+                )
+                if deleted:
+                    cleaned += 1
+                    stats.files_deleted += 1
+
+    stats.orphans_cleaned += cleaned
     if cleaned:
         logger.info("cleanup_orphaned_originals: deleted %d orphaned files", cleaned)
 
@@ -712,6 +887,9 @@ def run_archival(
     """
     stats = ArchivalStats()
     storage = SQLiteStorage(db_path)
+
+    # Ensure the pending_deletions table exists before any archival work.
+    _ensure_pending_deletions_table(storage)
 
     logger.info(
         "archival starting: db=%s archive=%s retention=%dd batch=%d dry_run=%s",

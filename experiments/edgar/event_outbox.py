@@ -643,6 +643,35 @@ class OutboxStore:
 
 
 # ---------------------------------------------------------------------------
+# Shared directory-fsync helper
+# ---------------------------------------------------------------------------
+
+def _fsync_directory(dir_path: Path) -> None:
+    """Fsync a directory so that new or renamed entries are durable.
+
+    This is the single implementation used by both ``ArtifactWriter`` (after
+    atomic renames) and the JSONL publishers (after creating a new daily
+    file).  Centralising the pattern avoids subtle divergence between the
+    two durability paths.
+    """
+    dir_fd = os.open(str(dir_path), os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+# Tracks file paths whose parent directory has already been fsynced in the
+# current process lifetime.  On first write to each daily JSONL file, the
+# publisher calls ``_fsync_directory``; subsequent appends to the same file
+# skip the redundant syscall.  This eliminates the TOCTOU race inherent in
+# ``not target.exists()`` — even if a previous process created the file but
+# crashed before its dir-fsync, the current process will re-issue the
+# dir-fsync on its first access.
+_dir_synced_paths: set[str] = set()
+
+
+# ---------------------------------------------------------------------------
 # Artifact writer — atomic filesystem writes
 # ---------------------------------------------------------------------------
 
@@ -671,11 +700,7 @@ class ArtifactWriter:
             fd = -1  # mark as closed
             os.rename(tmp_path, str(target_path))
             # Fsync the parent directory so the rename is durable.
-            dir_fd = os.open(str(target_path.parent), os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+            _fsync_directory(target_path.parent)
         except BaseException:
             if fd >= 0:
                 os.close(fd)
@@ -766,21 +791,21 @@ def _jsonl_write_sync(
 ) -> None:
     """Blocking write of a single JSON line — runs in a thread."""
     target.parent.mkdir(parents=True, exist_ok=True)
-    is_new_file = not target.exists()
     with open(target, "a", encoding="utf-8") as f:
         f.write(line + "\n")
         f.flush()
         os.fsync(f.fileno())
-    # When creating a new daily file, fsync the parent directory so the
-    # directory entry itself is durable.  Without this, a crash after
-    # the file fsync but before directory metadata flush could lose the
-    # file on some filesystems.
-    if is_new_file:
-        dir_fd = os.open(str(target.parent), os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+    # Fsync the parent directory on the first write to each daily file
+    # within the current process.  This uses a per-process tracking set
+    # rather than ``not target.exists()`` to avoid a TOCTOU race: if a
+    # prior process created the file but crashed before its dir-fsync,
+    # the directory entry could be non-durable yet ``target.exists()``
+    # would return True, skipping the critical fsync.  The tracking set
+    # guarantees at least one dir-fsync per file per process lifetime.
+    target_key = str(target)
+    if target_key not in _dir_synced_paths:
+        _fsync_directory(target.parent)
+        _dir_synced_paths.add(target_key)
 
 
 def _event_date_str(envelope: EventEnvelope) -> str:
@@ -868,19 +893,17 @@ async def jsonl_publish_batch_callback(
         publish_dir.mkdir(parents=True, exist_ok=True)
         for day_str, lines in by_day.items():
             target = publish_dir / f"events-{day_str}.jsonl"
-            is_new_file = not target.exists()
             with open(target, "a", encoding="utf-8") as f:
                 for ln in lines:
                     f.write(ln + "\n")
                 f.flush()
                 os.fsync(f.fileno())
-            # Fsync parent directory when creating a new day-file
-            if is_new_file:
-                dir_fd = os.open(str(target.parent), os.O_RDONLY)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
+            # Fsync parent directory on first access per process (see
+            # _jsonl_write_sync for the TOCTOU rationale).
+            target_key = str(target)
+            if target_key not in _dir_synced_paths:
+                _fsync_directory(target.parent)
+                _dir_synced_paths.add(target_key)
 
     await _asyncio.to_thread(_write_batch)
 
