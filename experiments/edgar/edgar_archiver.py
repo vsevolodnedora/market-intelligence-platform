@@ -200,14 +200,39 @@ def _streaming_sha256(path: Path) -> str:
 # Filing archiver
 # ---------------------------------------------------------------------------
 
+def _is_under_archive_dir(archive_dir: Path, path: str) -> bool:
+    """Return True if *path* already resides under *archive_dir*.
+
+    Uses resolved (symlink-free, absolute) paths so that relative paths,
+    trailing slashes, and symlinks do not cause false negatives.
+    """
+    try:
+        resolved = Path(path).resolve()
+        archive_resolved = archive_dir.resolve()
+        return resolved == archive_resolved or str(resolved).startswith(
+            str(archive_resolved).rstrip("/") + "/"
+        )
+    except (OSError, ValueError):
+        return False
+
+
 def _derive_archive_path(archive_dir: Path, original_path: str) -> Path:
     """Map a raw artifact path to an archive location.
+
+    If *original_path* already lives under *archive_dir*, it is returned
+    unchanged so that callers can detect src == dst and skip the copy /
+    delete cycle.
 
     Preserves the CIK/accession directory structure under archive_dir.
     Example:
         original: /data/edgar/.../raw/0001234567/000123456789012345/file.txt
         archived: /archive/0001234567/000123456789012345/file.txt
     """
+    # If the path is already archived, return it as-is to prevent the
+    # caller from treating it as a new src→dst pair.
+    if _is_under_archive_dir(archive_dir, original_path):
+        return Path(original_path)
+
     parts = Path(original_path).parts
     # Find the CIK directory (10-digit number) in the path
     for i, part in enumerate(parts):
@@ -395,6 +420,14 @@ def archive_filing(
 
     # Step 5: Delete originals only after DB commit succeeded
     for src, _dst in archived_files:
+        # Critical safety guard: if src and dst resolve to the same file
+        # (which happens when a previously-archived filing is re-selected),
+        # deleting src would destroy the only remaining copy.
+        if src.resolve() == _dst.resolve():
+            logger.debug(
+                "skip delete: src == dst for %s (%s)", acc, src,
+            )
+            continue
         if src.exists():
             if _safe_delete(src):
                 stats.files_deleted += 1
@@ -692,6 +725,29 @@ def run_archival(
         limit=batch_size,
         archive_dir=str(archive_dir),
     )
+
+    # Belt-and-suspenders: even if the storage layer does not honour
+    # archive_dir, drop filings whose artifact paths already reside
+    # under the archive root.  This prevents _derive_archive_path from
+    # producing dst == src, which would cause the delete step to
+    # destroy the archived copy.
+    filtered: list[dict[str, Any]] = []
+    for filing in eligible:
+        dominated = False
+        for field in ("raw_txt_path", "primary_doc_path"):
+            path_val = filing.get(field)
+            if path_val and _is_under_archive_dir(archive_dir, path_val):
+                dominated = True
+                break
+        if dominated:
+            logger.debug(
+                "pre-filter: skip %s — paths already archived",
+                filing.get("accession_number", "?"),
+            )
+        else:
+            filtered.append(filing)
+
+    eligible = filtered
     stats.filings_scanned = len(eligible)
     logger.info("found %d archival-eligible filings", len(eligible))
 

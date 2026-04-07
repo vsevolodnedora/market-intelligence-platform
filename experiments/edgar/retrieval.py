@@ -73,12 +73,18 @@ class FilingRetriever:
     async def fetch_header_only(self, discovery: FilingDiscovery) -> SubmissionHeader:
         """Fetch and parse hdr.sgml for header-gate resolution.
         Falls back to complete .txt if hdr.sgml is missing or malformed.
+
+        The hdr.sgml fetch uses ``max_retries=1`` because this file is
+        purely an optimisation — the .txt fallback always works.  The
+        SEC's CDN often returns 503 (not 404) for non-existent hdr.sgml
+        files, and retrying a non-existent resource wastes rate-limit
+        tokens and stalls the pipeline.
         """
         hdr_url = discovery.hdr_sgml_url or derive_hdr_sgml_url(
             discovery.archive_cik, discovery.accession_number,
         )
         try:
-            text = await self.client.get_text(hdr_url)
+            text = await self.client.get_text(hdr_url, max_retries=1)
             header = parse_submission_text(text)
             if header.parties:
                 return header
@@ -90,7 +96,10 @@ class FilingRetriever:
             if exc.status == 404:
                 logger.info("hdr.sgml not found for %s — falling back to .txt", discovery.accession_number)
             else:
-                logger.warning("hdr.sgml fetch failed for %s (HTTP %d)", discovery.accession_number, exc.status)
+                logger.info(
+                    "hdr.sgml unavailable for %s (HTTP %d) — falling back to .txt",
+                    discovery.accession_number, exc.status,
+                )
         except Exception:
             logger.exception("hdr.sgml parse failed for %s", discovery.accession_number)
 

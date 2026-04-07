@@ -370,11 +370,12 @@ class SECClient:
     async def __aexit__(self, *_: object) -> None:
         await self.aclose()
 
-    async def get_bytes(self, url: str) -> tuple[bytes, str | None]:
+    async def get_bytes(self, url: str, *, max_retries: int | None = None) -> tuple[bytes, str | None]:
         from metrics import METRICS
 
+        retries = max_retries if max_retries is not None else self._max_retries
         last_exc: Exception | None = None
-        for attempt in range(1, self._max_retries + 1):
+        for attempt in range(1, retries + 1):
             await self.rate_limiter.acquire()
             t0 = time.monotonic()
             try:
@@ -386,18 +387,18 @@ class SECClient:
                 METRICS.inc("edgar_sec_http_requests_total",
                             labels={"status_class": "err", "method": "GET"})
                 last_exc = exc
-                if attempt < self._max_retries:
+                if attempt < retries:
                     METRICS.inc("edgar_sec_http_retries_total")
                     backoff = self._retry_base * (2 ** (attempt - 1))
                     logger.warning(
                         "network error fetching %s (attempt %d/%d): %s — retrying in %.1fs",
-                        url, attempt, self._max_retries, exc, backoff,
+                        url, attempt, retries, exc, backoff,
                     )
                     await asyncio.sleep(backoff)
                 else:
                     logger.warning(
                         "network error fetching %s (attempt %d/%d, final): %s",
-                        url, attempt, self._max_retries, exc,
+                        url, attempt, retries, exc,
                     )
                 continue
 
@@ -414,7 +415,7 @@ class SECClient:
             if not err.is_retryable:
                 raise err
             last_exc = err
-            if attempt < self._max_retries:
+            if attempt < retries:
                 METRICS.inc("edgar_sec_http_retries_total")
                 backoff = self._retry_base * (2 ** (attempt - 1))
                 if status == 429:
@@ -426,7 +427,7 @@ class SECClient:
                         pass
                 logger.warning(
                     "HTTP %d from %s (attempt %d/%d) — retrying in %.1fs",
-                    status, url, attempt, self._max_retries, backoff,
+                    status, url, attempt, retries, backoff,
                 )
                 await asyncio.sleep(backoff)
             else:
@@ -434,12 +435,12 @@ class SECClient:
                     METRICS.inc("edgar_sec_http_429_total")
                 logger.warning(
                     "HTTP %d from %s (attempt %d/%d, final)",
-                    status, url, attempt, self._max_retries,
+                    status, url, attempt, retries,
                 )
-        raise last_exc or IOError(f"Failed to fetch {url} after {self._max_retries} attempts")
+        raise last_exc or IOError(f"Failed to fetch {url} after {retries} attempts")
 
-    async def get_text(self, url: str, encoding: str | None = None) -> str:
-        data, _ = await self.get_bytes(url)
+    async def get_text(self, url: str, encoding: str | None = None, *, max_retries: int | None = None) -> str:
+        data, _ = await self.get_bytes(url, max_retries=max_retries)
         if encoding:
             return data.decode(encoding, errors="replace")
         try:
