@@ -106,9 +106,228 @@ def _parse_nport_xml(xml_bytes: bytes, accession_number: str) -> FundFiling | No
         is_restricted = _find_text(inv_el, "isRestrictedSec")
         holding.is_restricted = is_restricted in ("Y", "true", "1") if is_restricted else False
 
+        # Debt-instrument fields (maturity date and coupon rate)
+        # These live under <debtSec> in the N-PORT schema but may also
+        # appear directly on the investment element in some filings.
+        holding.maturity_date = (
+            _find_text(inv_el, "debtSec/maturityDt")
+            or _find_text(inv_el, "maturityDt")
+        )
+        coupon_raw = (
+            _find_text(inv_el, "debtSec/couponKind/couponRate")
+            or _find_text(inv_el, "debtSec/couponRate")
+            or _find_text(inv_el, "couponRate")
+        )
+        holding.coupon_rate = _safe_float(coupon_raw)
+
         filing.holdings.append(holding)
 
     filing.holding_count = len(filing.holdings)
+
+    # Guard: if the XML parsed successfully but contained no recognisable
+    # N-PORT structure (no genInfo, no fundInfo, no holdings), this is not
+    # an N-PORT document — return None so the caller can try other paths.
+    has_nport_structure = (
+        gen_info is not None
+        or fund_info is not None
+        or filing.holdings
+    )
+    if not has_nport_structure:
+        logger.info(
+            "XML parsed for %s but contained no N-PORT structure "
+            "(no genInfo/fundInfo/holdings); returning None",
+            accession_number,
+        )
+        return None
+
+    filing.parse_source = "xml"
+    filing.parse_status = "complete"
+    return filing
+
+
+# ---------------------------------------------------------------------------
+# HTML fallback for SEC-rendered N-PORT filings
+# ---------------------------------------------------------------------------
+
+# Regex patterns for extracting N-PORT data from SEC HTML renderings.
+# SEC's EDGAR viewer renders N-PORT XML into HTML tables with
+# recognisable label/value patterns that mirror the XML element names.
+
+_HTML_LABEL_VALUE_RE = re.compile(
+    r"<t[dh][^>]*>\s*(?:<[^>]+>\s*)*([^<]+?)(?:\s*<[^>]+>)*\s*</t[dh]>"
+    r"\s*"
+    r"<t[dh][^>]*>\s*(?:<[^>]+>\s*)*([^<]*?)(?:\s*<[^>]+>)*\s*</t[dh]>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Broader table-row extraction for holdings tables.
+_HTML_TR_RE = re.compile(
+    r"<tr[^>]*>(.*?)</tr>",
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_TD_RE = re.compile(
+    r"<t[dh][^>]*>\s*(.*?)\s*</t[dh]>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_html(text: str) -> str:
+    """Remove HTML tags and collapse whitespace."""
+    return _HTML_TAG_RE.sub("", text).strip()
+
+
+def _parse_nport_html_fallback(
+    raw_bytes: bytes,
+    accession_number: str,
+) -> FundFiling | None:
+    """Extract N-PORT holdings from SEC-rendered HTML when XML parse fails.
+
+    This is a best-effort fallback for HTML/XML-like filings that
+    ElementTree cannot parse.  It returns a FundFiling only when it
+    extracts at least fund identity or report date AND at least one
+    holdings row — otherwise returns None to preserve fail-closed
+    semantics.
+    """
+    try:
+        text = raw_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+    filing = FundFiling(accession_number=accession_number)
+    filing.parse_source = "html_fallback"
+
+    # --- Extract metadata from label/value pairs ---
+    _META_MAP = {
+        "series id": "series_id",
+        "seriesid": "series_id",
+        "series name": "series_name",
+        "seriesname": "series_name",
+        "class id": "class_id",
+        "classid": "class_id",
+        "report date": "report_date",
+        "reporting period": "report_date",
+        "reppd": "report_date",
+        "total assets": "_total_assets",
+        "totassets": "_total_assets",
+        "net assets": "_net_assets",
+        "netassets": "_net_assets",
+    }
+
+    for m in _HTML_LABEL_VALUE_RE.finditer(text):
+        label = _strip_html(m.group(1)).lower().strip().rstrip(":")
+        value = _strip_html(m.group(2)).strip()
+        if not value:
+            continue
+        attr = _META_MAP.get(label)
+        if attr == "_total_assets":
+            filing.total_assets = _safe_float(value)
+        elif attr == "_net_assets":
+            filing.net_assets = _safe_float(value)
+        elif attr is not None:
+            setattr(filing, attr, value)
+
+    # --- Extract holdings from table rows ---
+    # Strategy: find the table that has a header row containing N-PORT
+    # holding column names (name, cusip, balance, value, etc.) and parse
+    # subsequent rows as holdings.
+    _HOLDING_HEADERS = {
+        "name", "cusip", "isin", "balance", "value",
+        "valussd", "valusd", "title", "lei",
+    }
+
+    header_indices: dict[str, int] = {}
+    in_holdings_table = False
+    holdings: list[FundHolding] = []
+
+    for tr_match in _HTML_TR_RE.finditer(text):
+        row_html = tr_match.group(1)
+        cells = [_strip_html(c.group(1)) for c in _HTML_TD_RE.finditer(row_html)]
+        if not cells:
+            continue
+
+        # Detect header row
+        lower_cells = [c.lower().strip() for c in cells]
+        header_hits = sum(1 for c in lower_cells if c in _HOLDING_HEADERS)
+        if header_hits >= 3:
+            header_indices = {c: i for i, c in enumerate(lower_cells)}
+            in_holdings_table = True
+            continue
+
+        if not in_holdings_table:
+            continue
+
+        # Empty row or new section — stop collecting
+        if not any(cells):
+            if holdings:
+                break
+            continue
+
+        def _cell(name: str) -> str | None:
+            idx = header_indices.get(name)
+            if idx is None or idx >= len(cells):
+                return None
+            v = cells[idx].strip()
+            return v if v else None
+
+        issuer_name = _cell("name")
+        cusip = _cell("cusip")
+        # Require at least one identifier per row
+        if not issuer_name and not cusip:
+            continue
+
+        holding = FundHolding(
+            issuer_name=issuer_name,
+            title=_cell("title"),
+            cusip=cusip,
+            isin=_cell("isin"),
+            lei=_cell("lei"),
+            balance=_safe_float(_cell("balance")),
+            units=_cell("units"),
+            value_usd=_safe_float(
+                _cell("valussd") or _cell("valusd") or _cell("value")
+            ),
+            pct_of_nav=_safe_float(_cell("pctval") or _cell("pct_of_nav")),
+            asset_category=_cell("assetcat") or _cell("asset_category"),
+            issuer_category=_cell("issuercat") or _cell("issuer_category"),
+            country=_cell("invcountry") or _cell("country"),
+            currency=_cell("curcd") or _cell("currency"),
+        )
+
+        is_restricted = _cell("isrestrictedsec") or _cell("is_restricted")
+        holding.is_restricted = is_restricted in ("Y", "true", "1") if is_restricted else False
+
+        holding.maturity_date = _cell("maturitydt") or _cell("maturity_date")
+        holding.coupon_rate = _safe_float(
+            _cell("couponrate") or _cell("coupon_rate")
+        )
+
+        holdings.append(holding)
+
+    # --- Fail-closed gate: require identity/date AND holdings ---
+    has_identity = bool(filing.series_id or filing.series_name or filing.report_date)
+    if not has_identity or not holdings:
+        logger.info(
+            "N-PORT HTML fallback for %s did not meet minimum extraction "
+            "threshold (identity=%s, holdings=%d); returning None",
+            accession_number,
+            has_identity,
+            len(holdings),
+        )
+        return None
+
+    filing.holdings = holdings
+    filing.holding_count = len(holdings)
+    # HTML fallback is inherently partial — table extraction may miss
+    # fields that the XML path would capture.
+    filing.parse_status = "partial"
+
+    logger.info(
+        "N-PORT HTML fallback extracted %d holdings for %s",
+        len(holdings),
+        accession_number,
+    )
     return filing
 
 
@@ -162,19 +381,27 @@ class FundHandler:
         if primary_bytes is None:
             return None
         try:
-            # N-PORT filings are XML-structured — do NOT fall back to
-            # a generic text parser on failure, because that would
-            # silently produce a metadata-only FundFiling that is
-            # indistinguishable from a successful parse with zero
-            # holdings, contaminating downstream datasets.
+            # N-PORT filings are XML-structured — try XML first.
             filing = _parse_nport_xml(primary_bytes, accession_number)
             if filing is None:
-                logger.warning(
+                # XML parse failed or produced no recognisable structure.
+                # Try the HTML fallback for SEC-rendered filings before
+                # giving up.  The fallback enforces its own minimum-
+                # extraction gate (identity + holdings) so it will not
+                # silently produce a metadata-only FundFiling.
+                logger.info(
                     "N-PORT XML parse returned None for %s; "
-                    "returning parse failure (no text fallback)",
+                    "attempting HTML fallback",
                     accession_number,
                 )
-                return None
+                filing = _parse_nport_html_fallback(primary_bytes, accession_number)
+                if filing is None:
+                    logger.warning(
+                        "N-PORT HTML fallback also failed for %s; "
+                        "returning parse failure",
+                        accession_number,
+                    )
+                    return None
 
             form_upper = (header.form_type or "").upper().strip()
             filing.form_type = form_upper

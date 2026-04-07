@@ -708,6 +708,8 @@ class FundFiling:
     net_assets: float | None = None
     holding_count: int = 0
     holdings: list[FundHolding] = field(default_factory=list)
+    parse_source: str = "xml"          # "xml" | "html_fallback"
+    parse_status: str = "complete"     # "complete" | "partial"
 
 
 # ---------------------------------------------------------------------------

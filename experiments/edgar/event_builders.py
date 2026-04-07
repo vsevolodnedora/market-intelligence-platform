@@ -338,14 +338,24 @@ def build_fund_event(
         reverse=True,
     )[:20]
 
-    # Distinguish full holdings parse (N-PORT) from metadata-only
-    # (497, 485, N-CEN) so downstream consumers never confuse
-    # "no holdings extracted" with "holdings not applicable".
-    form_upper = (filing.form_type or "").upper()
-    if form_upper.startswith("N-PORT"):
-        parse_status = "complete"
-    else:
-        parse_status = "metadata_only"
+    # Use the explicit parse provenance from the FundFiling object.
+    # This replaces the previous logic that inferred completeness
+    # from form_type alone, which would incorrectly label HTML-
+    # fallback/partial parses as "complete".
+    parse_status = getattr(filing, "parse_status", None)
+    parse_source = getattr(filing, "parse_source", None)
+
+    # Backwards-compatible default for FundFiling objects that
+    # pre-date the parse_source/parse_status fields (e.g. non-
+    # N-PORT metadata-only filings from _parse_fund_text).
+    if parse_status is None:
+        form_upper = (filing.form_type or "").upper()
+        if form_upper.startswith("N-PORT"):
+            parse_status = "complete"
+        else:
+            parse_status = "metadata_only"
+    if parse_source is None:
+        parse_source = "xml"
 
     return EventEnvelope.new(
         subject=EventSubjects.FUND_FILING_PARSED,
@@ -361,6 +371,7 @@ def build_fund_event(
             "net_assets": filing.net_assets,
             "holding_count": filing.holding_count,
             "parse_status": parse_status,
+            "parse_source": parse_source,
             "top_holdings": [
                 {
                     "issuer_name": h.issuer_name,
