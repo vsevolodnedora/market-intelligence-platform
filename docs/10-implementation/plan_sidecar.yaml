@@ -1,0 +1,410 @@
+doc_id: staged-plan-r11-2
+title: "Staged Plan (revision 11_2)"
+content_hash_hint: "sha1:8dee015294a2"
+source_citation: ""
+sections:
+
+- id: staged-plan-r11-2-layout
+  heading: "1. Layout"
+  level: 2
+  summary: "Defines the module layout and the rule that only contract.py is public across module boundaries."
+  tags: [architecture, modules, contracts]
+  line_start: 14
+  line_end: 61
+
+- id: staged-plan-r11-2-events-module
+  heading: "1bis. `events` module — frozen day 1 (`modules/events/`) [C1]"
+  level: 2
+  summary: "Defines the zero-logic shared events module and the cross-module payloads it owns to break contract cycles."
+  tags: [events, contracts, payloads]
+  line_start: 62
+  line_end: 75
+
+- id: staged-plan-r11-2-kernel
+  heading: "2. Kernel — frozen day 1 (`modules/kernel/`)"
+  level: 2
+  summary: "Defines the thin shared kernel that provides the base types, IDs, protocols, and enums for the system."
+  tags: [kernel, contracts, foundation]
+  line_start: 76
+  line_end: 79
+
+- id: staged-plan-r11-2-kernel-identifiers
+  heading: "2.1 Identifier types (opaque, strongly typed)"
+  level: 3
+  summary: "Lists the opaque identifier types and shared identity shapes that must be used at module boundaries."
+  tags: [ids, types, identity]
+  line_start: 80
+  line_end: 94
+
+- id: staged-plan-r11-2-kernel-money-time
+  heading: "2.2 Money and time"
+  level: 3
+  summary: "Defines the shared money, currency, time, and effective-date primitives."
+  tags: [types, money, time]
+  line_start: 95
+  line_end: 102
+
+- id: staged-plan-r11-2-kernel-event-envelope
+  heading: "2.3 Event envelope"
+  level: 3
+  summary: "Specifies the persisted event envelope and versioning rules for all domain events."
+  tags: [events, schema, versioning]
+  line_start: 103
+  line_end: 117
+
+- id: staged-plan-r11-2-kernel-protocols
+  heading: "2.4 Protocols"
+  level: 3
+  summary: "Defines injected runtime interfaces such as clocks, buses, and deterministic ID generation."
+  tags: [protocols, runtime, replay]
+  line_start: 118
+  line_end: 123
+
+- id: staged-plan-r11-2-kernel-outcomes-errors
+  heading: "2.5 Result / error"
+  level: 3
+  summary: "Defines the shared outcome and domain-error model used across module boundaries."
+  tags: [errors, result, contracts]
+  line_start: 124
+  line_end: 129
+
+- id: staged-plan-r11-2-kernel-enums
+  heading: "2.6 Shared enums"
+  level: 3
+  summary: "Defines shared enums for trading, reconciliation, terminal-state, and phase verdict concepts."
+  tags: [enums, state, policy]
+  line_start: 130
+  line_end: 143
+
+- id: staged-plan-r11-2-domain-modules
+  heading: "3. Domain modules — frozen contract surfaces"
+  level: 2
+  summary: "Defines the responsibilities, contracts, readers, commands, events, and invariants for each bounded domain module."
+  tags: [modules, contracts, invariants]
+  line_start: 144
+  line_end: 147
+
+- id: staged-plan-r11-2-platform-runtime
+  heading: "3.1 `platform_runtime/`"
+  level: 3
+  summary: "Defines the runtime layer that persists events, dispatches subscribers, and replays projections deterministically."
+  tags: [module, runtime, replay]
+  line_start: 148
+  line_end: 163
+
+- id: staged-plan-r11-2-market-policy
+  heading: "3.2 `market_policy/`"
+  level: 3
+  summary: "Defines effective-dated reference data, governance decisions, gate verdicts, production profiles, and policy invariants."
+  tags: [module, policy, governance]
+  line_start: 164
+  line_end: 209
+
+- id: staged-plan-r11-2-execution
+  heading: "3.3 `execution/`"
+  level: 3
+  summary: "Defines broker-facing execution facts, canonical identity, corrections, re-submit budgets, and deterministic limit-price construction."
+  tags: [module, execution, broker]
+  line_start: 210
+  line_end: 246
+
+- id: staged-plan-r11-2-portfolio-accounting
+  heading: "3.4 `portfolio_accounting/`"
+  level: 3
+  summary: "Defines the append-only economic journal, cash decomposition, settlement forecast, and churn-budget projection."
+  tags: [module, accounting, journal]
+  line_start: 247
+  line_end: 271
+
+- id: staged-plan-r11-2-admission-control
+  heading: "3.5 `admission_control/`"
+  level: 3
+  summary: "Defines the live admission contract, frozen inputs, pure predicate, and admissibility composition logic."
+  tags: [module, admission, predicate]
+  line_start: 272
+  line_end: 337
+
+- id: staged-plan-r11-2-tax
+  heading: "3.6 `tax/`"
+  level: 3
+  summary: "Defines the dual-ledger tax model, reviewer-approved exception workflow, and bridge into accounting."
+  tags: [module, tax, ledgers]
+  line_start: 338
+  line_end: 366
+
+- id: staged-plan-r11-2-ops-reconciliation
+  heading: "3.7 `ops_reconciliation/`"
+  level: 3
+  summary: "Defines cross-channel Green/Amber/Red state, breaks, conservative reads, and compliance staleness handling."
+  tags: [module, reconciliation, channels]
+  line_start: 367
+  line_end: 386
+
+- id: staged-plan-r11-2-strategy-simulation
+  heading: "3.8 `strategy_simulation/`"
+  level: 3
+  summary: "Defines the phase-0 harness, canonical simulator, overlays, and gate-evidence production rules."
+  tags: [module, simulation, research]
+  line_start: 387
+  line_end: 413
+
+- id: staged-plan-r11-2-orchestration-flows
+  heading: "4. Cross-module orchestration — canonical flows"
+  level: 2
+  summary: "Defines the canonical cross-module event flows and delivery order enforced by the runtime."
+  tags: [flows, orchestration, events]
+  depends_on: [staged-plan-r11-2-domain-modules]
+  line_start: 414
+  line_end: 417
+
+- id: staged-plan-r11-2-flow-happy-path
+  heading: "4.1 Happy path: intent → admission → fill → journal → tax"
+  level: 3
+  summary: "Shows the normal end-to-end flow from strategy intent through admission, execution, accounting, tax, and reconciliation."
+  tags: [flow, trading, pipeline]
+  depends_on:
+
+  - staged-plan-r11-2-admission-control
+  - staged-plan-r11-2-execution
+  - staged-plan-r11-2-portfolio-accounting
+  - staged-plan-r11-2-tax
+
+  line_start: 418
+  line_end: 457
+
+- id: staged-plan-r11-2-flow-corrections-replay
+  heading: "4.2 Corrections replay"
+  level: 3
+  summary: "Shows how broker corrections propagate through accounting and tax and how replay reproduces canonical economic state."
+  tags: [flow, corrections, replay]
+  depends_on:
+
+  - staged-plan-r11-2-execution
+  - staged-plan-r11-2-portfolio-accounting
+  - staged-plan-r11-2-tax
+  line_start: 458
+  line_end: 475
+
+- id: staged-plan-r11-2-flow-data-state-transitions
+  heading: "4.3 Data-state transitions"
+  level: 3
+  summary: "Shows how reconciliation divergence changes channel state and how admission reacts to Green, Amber, and Red."
+  tags: [flow, reconciliation, state]
+  depends_on:
+
+  - staged-plan-r11-2-ops-reconciliation
+  - staged-plan-r11-2-admission-control
+  line_start: 476
+  line_end: 489
+
+- id: staged-plan-r11-2-flow-tax-annual-close
+  heading: "4.4 Tax annual close"
+  level: 3
+  summary: "Shows the annual tax-reconciliation and reviewer-signoff flow, including candidate proposals and bridge adjustments."
+  tags: [flow, tax, annual-close]
+  depends_on:
+
+  - staged-plan-r11-2-tax
+  - staged-plan-r11-2-portfolio-accounting
+  line_start: 490
+  line_end: 515
+
+- id: staged-plan-r11-2-flow-phase-0-pre-screen
+  heading: "4.5 Phase 0 pre-screen"
+  level: 3
+  summary: "Shows the evidence registration, frozen protocol, evaluation, and governance verdict flow for Phase 0."
+  tags: [flow, phase-0, research]
+  depends_on:
+
+  - staged-plan-r11-2-market-policy
+  - staged-plan-r11-2-strategy-simulation
+  line_start: 516
+  line_end: 547
+
+- id: staged-plan-r11-2-flow-terminal-state-declaration
+  heading: "4.6 Terminal state declaration"
+  level: 3
+  summary: "Shows how gate verdict status constrains declaration of narrow or full v1 terminal states."
+  tags: [flow, terminal-state, gates]
+  depends_on: [staged-plan-r11-2-market-policy]
+  line_start: 548
+  line_end: 582
+
+- id: staged-plan-r11-2-flow-route-repinning
+  heading: "4.7 Route re-pinning"
+  level: 3
+  summary: "Shows how re-pinning the production profile invalidates gate support and strategy certification until fresh evidence exists."
+  tags: [flow, re-pinning, profiles]
+  depends_on:
+
+  - staged-plan-r11-2-market-policy
+  - staged-plan-r11-2-strategy-simulation
+  line_start: 583
+  line_end: 623
+
+- id: staged-plan-r11-2-flow-gate-verdict-recording
+  heading: "4.8 Gate verdict recording"
+  level: 3
+  summary: "Shows when each gate verdict may be recorded and what evidence each gate requires."
+  tags: [flow, gates, evidence]
+  depends_on:
+
+  - staged-plan-r11-2-market-policy
+  - staged-plan-r11-2-strategy-simulation
+  line_start: 624
+  line_end: 688
+
+- id: staged-plan-r11-2-dependency-import-rules
+  heading: "5. Dependency / import rules"
+  level: 2
+  summary: "Defines the compile-time dependency graph and the contract-only import rules that keep the architecture acyclic."
+  tags: [dependencies, imports, layering]
+  depends_on:
+
+  - staged-plan-r11-2-layout
+  - staged-plan-r11-2-events-module
+  - staged-plan-r11-2-domain-modules
+  line_start: 689
+  line_end: 727
+
+- id: staged-plan-r11-2-build-order
+  heading: "6. Build order"
+  level: 2
+  summary: "Defines the phased delivery sequence, exit gates, and when each module surface becomes frozen."
+  tags: [plan, sequencing, delivery]
+  depends_on:
+
+  - staged-plan-r11-2-dependency-import-rules
+  - staged-plan-r11-2-domain-modules
+  line_start: 728
+  line_end: 746
+
+- id: staged-plan-r11-2-validation-matrix
+  heading: "7. Validation matrix — idea section → scaffold location"
+  level: 2
+  summary: "Maps each idea requirement to the owning scaffold section or module for traceability."
+  tags: [traceability, mapping, coverage]
+  depends_on:
+
+  - staged-plan-r11-2-domain-modules
+  - staged-plan-r11-2-orchestration-flows
+  - staged-plan-r11-2-build-order
+  line_start: 747
+  line_end: 807
+
+- id: staged-plan-r11-2-test-obligations
+  heading: "8.  Test obligations"
+  level: 2
+  summary: "Defines the required automated test coverage and CI gates for each module and for cross-module behavior."
+  tags: [tests, acceptance, ci]
+  depends_on:
+
+  - staged-plan-r11-2-domain-modules
+  - staged-plan-r11-2-orchestration-flows
+  - staged-plan-r11-2-dependency-import-rules
+  line_start: 808
+  line_end: 811
+
+- id: staged-plan-r11-2-tests-kernel
+  heading: "8.1 Kernel"
+  level: 3
+  summary: "Defines the required property tests for kernel primitives and deterministic ID behavior."
+  tags: [tests, kernel, properties]
+  line_start: 812
+  line_end: 815
+
+- id: staged-plan-r11-2-tests-events
+  heading: "8.1bis `events` [C1]"
+  level: 3
+  summary: "Defines the required import, type-only, and cycle-elimination tests for the shared events module."
+  tags: [tests, events, imports]
+  line_start: 816
+  line_end: 823
+
+- id: staged-plan-r11-2-tests-platform-runtime
+  heading: "8.2 `platform_runtime`"
+  level: 3
+  summary: "Defines required tests for append-only persistence, replay determinism, and outbox atomicity."
+  tags: [tests, runtime, replay]
+  line_start: 824
+  line_end: 829
+
+- id: staged-plan-r11-2-tests-execution
+  heading: "8.3 `execution`"
+  level: 3
+  summary: "Defines required tests for identity, correction handling, re-submit budgets, limit-price construction, and runtime tags."
+  tags: [tests, execution, broker]
+  line_start: 830
+  line_end: 840
+
+- id: staged-plan-r11-2-tests-portfolio-accounting
+  heading: "8.4 `portfolio_accounting`"
+  level: 3
+  summary: "Defines required tests for journal invariance, reserved cash, fee components, and settlement guardrails."
+  tags: [tests, accounting, journal]
+  line_start: 841
+  line_end: 853
+
+- id: staged-plan-r11-2-tests-market-policy
+  heading: "8.5 `market_policy`"
+  level: 3
+  summary: "Defines required tests for additive policy data, gate logic, profile scoping, and certification invalidation."
+  tags: [tests, policy, governance]
+  line_start: 854
+  line_end: 873
+
+- id: staged-plan-r11-2-tests-admission-control
+  heading: "8.6 `admission_control`"
+  level: 3
+  summary: "Defines required tests for predicate coverage, determinism, conservative inputs, and composed live admissibility."
+  tags: [tests, admission, predicate]
+  line_start: 874
+  line_end: 889
+
+- id: staged-plan-r11-2-tests-tax
+  heading: "8.7 `tax`"
+  level: 3
+  summary: "Defines required tests for ledger separation, evidence requirements, candidate approval, and per-trade tax-friction behavior."
+  tags: [tests, tax, ledgers]
+  line_start: 890
+  line_end: 900
+
+- id: staged-plan-r11-2-tests-ops-reconciliation
+  heading: "8.8 `ops_reconciliation`"
+  level: 3
+  summary: "Defines required tests for deterministic channel-state transitions, freezes, fee breaks, and staleness alarms."
+  tags: [tests, reconciliation, channels]
+  line_start: 901
+  line_end: 911
+
+- id: staged-plan-r11-2-tests-strategy-simulation
+  heading: "8.9 `strategy_simulation`"
+  level: 3
+  summary: "Defines required tests for simulator validity, profile binding, overlays, and phase-0 structural rules."
+  tags: [tests, simulation, research]
+  line_start: 912
+  line_end: 923
+
+- id: staged-plan-r11-2-tests-cross-module
+  heading: "8.10 Cross-module"
+  level: 3
+  summary: "Defines end-to-end rehearsals for gate progression, re-pinning, staleness freezes, paper-to-live cutover, and no-cycle enforcement."
+  tags: [tests, integration, flows]
+  depends_on:
+
+  - staged-plan-r11-2-orchestration-flows
+  - staged-plan-r11-2-dependency-import-rules
+  line_start: 924
+  line_end: 936
+
+- id: staged-plan-r11-2-self-check-before-implementation
+  heading: "9. Self-check before implementation"
+  level: 2
+  summary: "Provides a final checklist that the architecture, ownership boundaries, and gating assumptions are coherent before implementation starts."
+  tags: [checklist, readiness, architecture]
+  depends_on:
+
+  - staged-plan-r11-2-build-order
+  - staged-plan-r11-2-dependency-import-rules
+  line_start: 937
+  line_end: 982
